@@ -60,6 +60,14 @@ class LabTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "repair binary"):
                 lab._load_frozen(root, expected)
 
+    def test_frozen_resume_rejects_changed_native_search_options(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected, _ = self.frozen_fixture(root)
+            options = dict(lab.DEFAULT_NATIVE_OPTIONS, joint_helpers=24)
+            with self.assertRaisesRegex(ValueError, "native_options"):
+                lab._load_frozen(root, dict(expected, native_options=options))
+
     def test_sample_spans_cost_distribution_without_duplicates(self):
         puzzles = [Puzzle(str(i), (1,), (1,), 1) for i in range(1000)]
         costs = {p.id: ValidationResult(int(p.id), 1) for p in puzzles}

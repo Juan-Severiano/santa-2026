@@ -35,13 +35,21 @@ def find_rustc(explicit=None):
 def build(engine, source, output, rustc=None):
     source, output = source.resolve(), output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    source_hash = digest(source)
-    frozen = output.parent / "build-sources" / source_hash / source.name
-    frozen.parent.mkdir(parents=True, exist_ok=True)
-    if not frozen.exists():
-        frozen.write_bytes(source.read_bytes())
-    if digest(frozen) != source_hash:
-        raise ValueError("Frozen build source was modified")
+    suffixes = {"rust": {".rs"}, "cpp": {".cpp", ".h", ".hpp"}, "go": {".go"}}[engine]
+    sources = {path.name: path.read_bytes() for path in sorted(source.parent.iterdir())
+               if path.is_file() and path.suffix in suffixes}
+    source_hash = hashlib.sha256(sources[source.name]).hexdigest()
+    dependencies = {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()}
+    bundle_hash = hashlib.sha256(json.dumps(dependencies, sort_keys=True).encode()).hexdigest()
+    frozen_directory = output.parent / "build-sources" / bundle_hash
+    frozen_directory.mkdir(parents=True, exist_ok=True)
+    for name, data in sources.items():
+        destination = frozen_directory / name
+        if not destination.exists():
+            destination.write_bytes(data)
+        if digest(destination) != dependencies[name]:
+            raise ValueError("Frozen build source was modified")
+    frozen = frozen_directory / source.name
     temporary = output.with_suffix(".building")
     environment = os.environ.copy()
     if engine == "cpp":
@@ -68,6 +76,7 @@ def build(engine, source, output, rustc=None):
     version = subprocess.run(version_command, check=True, text=True, capture_output=True).stdout.strip()
     report = {
         "engine": engine, "source": str(source), "source_sha256": source_hash,
+        "source_dependencies": dependencies,
         "compiler": version, "flags": flags, "binary_sha256": digest(output),
         "platform": platform.platform(), "machine": platform.machine(),
     }

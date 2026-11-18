@@ -10,12 +10,12 @@ This module never downloads or compiles anything implicitly.
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 from pathlib import Path
 
 from .core import Puzzle, validate_program
+from .native_output import read_program_output
 
 
 DEFAULT_REPAIR_ENGINE = "rust"
@@ -69,15 +69,23 @@ def _invoke(puzzle, seed, effort, mode, hint=None):
                str(mode), str(schedule_seed)]
     if hint is not None:
         command += [os.environ.get("SANTA2026_REPAIR_TRIALS", "12"), os.environ.get("SANTA2026_REPAIR_PASSES", "1")]
-    completed = subprocess.run(
-        command,
-        input=line, text=True, capture_output=True, timeout=120 * max(1, effort), check=True,
-    )
-    identifier, cell = completed.stdout.strip().split(" ", 1)
-    if identifier != "puzzle":
+    try:
+        completed = subprocess.run(
+            command,
+            input=line, text=True, capture_output=True, timeout=120 * max(1, effort), check=True,
+        )
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+        recovered = None
+        try:
+            recovered = read_program_output(error.stdout, puzzle, require_complete=True)
+        except (ValueError, TypeError, RecursionError):
+            pass
+        if recovered is not None:
+            return recovered
+        raise
+    program = read_program_output(completed.stdout, puzzle)
+    if program is None:
         raise ValueError("Unexpected native solver response")
-    program = json.loads(cell)
-    validate_program(puzzle, program)
     return program
 
 

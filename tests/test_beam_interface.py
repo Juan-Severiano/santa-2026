@@ -45,6 +45,41 @@ class BeamInterfaceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 solve_beam(puzzle)
 
+    def test_complete_timeout_output_is_recovered_and_replayed(self):
+        puzzle = Puzzle("toy", (3,), (1,), 3)
+        failure = subprocess.TimeoutExpired("engine", 1, output=b'puzzle [["/",0,0,1]]\npuzzle [\xf0\x9f')
+        with patch("santa2026.beam.subprocess.run", side_effect=failure):
+            self.assertEqual(solve_beam(puzzle), [["/", 0, 0, 1]])
+
+    def test_complete_nonzero_exit_output_is_recovered(self):
+        puzzle = Puzzle("toy", (3,), (1,), 3)
+        failure = subprocess.CalledProcessError(1, "engine", output='puzzle [["/",0,0,1]]\n', stderr="cleanup failed")
+        with patch("santa2026.beam.subprocess.run", side_effect=failure):
+            self.assertEqual(solve_beam(puzzle), [["/", 0, 0, 1]])
+
+    def test_partial_invalid_or_duplicate_output_preserves_original_process_failure(self):
+        puzzle = Puzzle("toy", (3,), (1,), 3)
+        outputs = (None, 'puzzle [["/",0,0,1]]', 'puzzle []\n', 'puzzle [\n',
+                   'wrong [["/",0,0,1]]\n', 'puzzle [["/",0,0,1]]\n' * 2)
+        for failure_type in (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            for output in outputs:
+                failure = (failure_type("engine", 1, output=output)
+                           if failure_type is subprocess.TimeoutExpired
+                           else failure_type(1, "engine", output=output))
+                with self.subTest(failure=failure), patch("santa2026.beam.subprocess.run", side_effect=failure):
+                    with self.assertRaises(failure_type) as caught:
+                        solve_beam(puzzle)
+                    self.assertIs(caught.exception, failure)
+
+    def test_polish_keeps_input_when_recovered_output_is_longer(self):
+        puzzle = Puzzle("toy", (3,), (1,), 3)
+        original = [["/", 0, 0, 1]]
+        failure = subprocess.TimeoutExpired("engine", 1, output='puzzle [["/",0,0,1],["+",1,1,2]]\n')
+        with patch("santa2026.beam.subprocess.run", side_effect=failure):
+            result = polish_beam(puzzle, original)
+        self.assertEqual(result, original)
+        self.assertIsNot(result, original)
+
 
 if __name__ == "__main__":
     unittest.main()

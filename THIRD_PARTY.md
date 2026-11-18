@@ -27,3 +27,13 @@ whose saved dataset metadata specifies `apache-2.0`. The frozen reference has 14
 the comparison baseline has 144,238 after incorporating local improvements. Those inherited programs
 are not attributed to the language ports. Dataset metadata, validation reports and CSV snapshots remain
 in the ignored local data/output directories.
+
+Later Rust quality experiments use the public programs from **Atakan Aldemir**,
+[Santa 2026 Joint Recipes for Large Puzzles, version 2](https://www.kaggle.com/code/atakanaldemir/santa-2026-joint-recipes-for-large-puzzles?scriptVersionId=371115522).
+The owning notebook explicitly identifies its license as Apache 2.0, verified on 2026-11-18.
+Its 1,000 programs replay with 142,272 instructions and SHA-256
+`145703a2287ef24eb3bc141708538cd8ba013a5d43f5126a2f3f1af9bdc592fc`.
+The pinned notebook, original upstream attributions, source bundle, license evidence and validation
+are preserved locally under `data/public/research/reference-atakan-v2/`. This is an inherited public
+reference, not an improvement produced by the Rust experiments. The Rust joint-recipe search uses
+coordinated graph mutations, whereas the notebook's published joint selection uses CP-SAT.

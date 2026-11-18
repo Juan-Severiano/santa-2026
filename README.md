@@ -182,6 +182,53 @@ O Kaggle confirmou **144.213** na submissão **58519516**; a meta abaixo de 100.
 escolher outro motor para o modo 6. O laboratório congela esse executável e verifica seu hash na
 retomada, separadamente do motor de construção.
 
+## Pesquisa em Rust após o checkpoint
+
+A nova referência de pesquisa é o portfólio público Apache-2.0 de
+[Atakan Aldemir, versão 2](https://www.kaggle.com/code/atakanaldemir/santa-2026-joint-recipes-for-large-puzzles?scriptVersionId=371115522),
+validado separadamente com **142.272 instruções**. Esse avanço sobre o checkpoint oficial de 144.213
+vem da referência pública; a contribuição de cada experimento é medida além dela. Proveniência,
+licença, notebook fixado e replay ficam em `data/public/research/reference-atakan-v2/`.
+
+Os motores experimentais compartilham o reparo original sem alterar `rust/repair.rs`:
+
+- `rust/optimizer.rs` reconstrói grupos de 6–10 alvos com lookahead e três estados de grafo.
+  A opção `SANTA2026_OPTIMIZER_BOUNDARY=1` prioriza os valores do prefixo que entram na parte removida
+  e conserva alternativas construídas a partir das receitas originais, cobrando as operações usadas.
+- `rust/joint.rs` combina receitas de vários programas, gera intermediários novos e testa mudanças
+  coordenadas no helper e nos seus consumidores. Cada grafo passa por detecção de ciclos, alocação
+  real de 48 registradores e replay inteiro antes de substituir o baseline.
+- `rust/factor_groups.rs` procura fatores comuns ausentes, constrói também os quocientes e replaneja
+  o grupo de alvos. Fatores e constantes são cobrados; receitas inseguras são bloqueadas e o grafo
+  completo precisa passar na alocação e no replay.
+
+```sh
+python3 scripts/build_native.py --engine rust --source rust/optimizer.rs --output outputs/bin/optimizer-rust
+python3 scripts/build_native.py --engine rust --source rust/joint.rs --output outputs/bin/joint-rust
+python3 scripts/build_native.py --engine rust --source rust/factor_groups.rs --output outputs/bin/factor-groups-rust
+python3 scripts/lab.py --puzzles data/puzzles.csv --baseline outputs/rust-research-baseline.csv --output outputs/labs/rust-joint --strategies rustjoint --candidates outputs/rust-main-submission.csv --joint-helpers 24 --sample 30 --jobs 1
+```
+
+O builder congela também os arquivos Rust incluídos. O laboratório assina `--joint-helpers`,
+`--optimizer-boundary` e `--optimizer-ms` e restaura seus valores em cada worker; alterar essas opções
+impede reutilizar checkpoints incompatíveis. `--ids-file` aceita uma lista JSON de puzzles exatos.
+
+`scripts/rust_quality.py` compara qualidade sob um orçamento máximo por puzzle, intercalando métodos
+e preservando o portfólio completo nos puzzles não testados. Os programas completos já emitidos podem
+ser recuperados após timeout ou erro de processo, desde que passem na validação independente.
+Resultados reais nesta base:
+
+| Experimento | Casos | Limite por caso/método | Ganho observado |
+| --- | ---: | ---: | ---: |
+| Reparo, caudas e receitas V1 | 30 | 4 s | 0 |
+| Fronteira prioritária e novos helpers V2 | 30 | 4 s | 0 |
+| Macros dirigidas de helper e consumidores V3 | 10 | 8 s | 0 |
+| Síntese de fatores e quocientes compartilhados | 10 | 8 s | 0 |
+
+Todos esses lotes mantiveram programas válidos e a nota de 142.272. Ganhos nos exemplos pequenos dos
+testes demonstram o comportamento das novas buscas, mas não são apresentados como ganho na competição.
+Os experimentos não sustentam uma projeção abaixo de 100.000.
+
 ## Validação
 
 O verificador usa inteiros do Python, sem ponto flutuante. Confere as quatro operações, divisão sem resto,
@@ -189,7 +236,7 @@ positividade, `value_limit`, fontes definidas, índices, cobertura acumulada dos
 4.096 instruções e 131.072 bytes UTF-8 por célula. A leitura exige exatamente as colunas `id,program`,
 IDs únicos e um programa JSON válido. Ao pontuar, exige os mesmos IDs do arquivo de puzzles fornecido.
 
-Os 118 testes passam, incluindo integração compilada, paridade C++/Rust/Go e o laboratório. Eles cobrem o exemplo oficial de quatro instruções, operações inválidas, inteiros até `10^18`, leitura
+Os 148 testes passam, incluindo integração compilada, paridade C++/Rust/Go e o laboratório. As três suítes Rust dos novos motores também passam. Eles cobrem o exemplo oficial de quatro instruções, operações inválidas, inteiros até `10^18`, leitura
 antes de sobrescrita, cobertura depois de reciclar um alvo, serialização CSV/JSON, limites e puzzles aleatórios.
 O sample oficial passou nos 1.000 puzzles, com **1.490.379 instruções**. Uma comparação independente de
 10.000 programas aleatórios encontrou zero divergências entre o verificador e um segundo interpretador.

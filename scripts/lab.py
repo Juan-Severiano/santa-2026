@@ -18,6 +18,7 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 WORKER_CANDIDATES = []
+DEFAULT_NATIVE_OPTIONS = {"optimizer_ms": None, "optimizer_boundary": 0, "joint_helpers": 0}
 sys.path.insert(0, str(REPOSITORY / "src"))
 
 from santa2026.core import (  # noqa: E402
@@ -52,6 +53,11 @@ def _load_frozen(output, requested):
     for key in ("polish_mode", "repair_trials", "repair_passes"):
         if key in configuration and configuration[key] != requested.get(key):
             raise ValueError(f"frozen experiment requires its original {key}")
+    if "native_options" in requested:
+        if configuration.get("native_options", DEFAULT_NATIVE_OPTIONS) != requested["native_options"]:
+            raise ValueError("frozen experiment requires its original native_options")
+        if "rustjoint" in configuration["strategies"] and "native_options" not in configuration:
+            raise ValueError("frozen joint experiment is missing signed native_options")
     hashes = configuration["source_hashes"]
     code_id = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()[:16]
     snapshot = output / "code" / code_id
@@ -72,6 +78,10 @@ def _load_frozen(output, requested):
         repair_executable = output / "binaries" / configuration["repair_binary_sha256"]
         if not repair_executable.is_file() or _hash(repair_executable) != configuration["repair_binary_sha256"]:
             raise ValueError("frozen repair binary is missing or damaged")
+    if "joint_binary_sha256" in configuration:
+        joint_executable = output / "binaries" / configuration["joint_binary_sha256"]
+        if not joint_executable.is_file() or _hash(joint_executable) != configuration["joint_binary_sha256"]:
+            raise ValueError("frozen joint-recipe binary is missing or damaged")
     return configuration, signature, snapshot, executable
 
 
@@ -86,7 +96,7 @@ def select_puzzles(puzzles, costs, count):
     return [ordered[((2 * index + 1) * len(ordered)) // (2 * count)] for index in range(count)]
 
 
-def _initialize(snapshot, beam_binary=None, beam_mode=0, repair_mode=6, repair_trials=12, repair_passes=1, candidates=(), mitm_binary=None, repair_binary=None):
+def _initialize(snapshot, beam_binary=None, beam_mode=0, repair_mode=6, repair_trials=12, repair_passes=1, candidates=(), mitm_binary=None, repair_binary=None, joint_binary=None, native_options=None):
     # Each experiment runs immutable source copies even while a new strategy
     # is being developed in the main checkout. core's dataclasses stay shared.
     import santa2026
@@ -103,8 +113,22 @@ def _initialize(snapshot, beam_binary=None, beam_mode=0, repair_mode=6, repair_t
     os.environ["SANTA2026_REPAIR_MODE"] = str(repair_mode)
     os.environ["SANTA2026_REPAIR_TRIALS"] = str(repair_trials)
     os.environ["SANTA2026_REPAIR_PASSES"] = str(repair_passes)
+    native_options = native_options or DEFAULT_NATIVE_OPTIONS
+    # Group synthesis shares the signed optimizer deadline. A separate shell
+    # override must not silently change a resumed experiment.
+    os.environ.pop("SANTA2026_GROUPS_MS", None)
+    os.environ["SANTA2026_OPTIMIZER_BOUNDARY"] = str(native_options["optimizer_boundary"])
+    os.environ["SANTA2026_JOINT_HELPERS"] = str(native_options["joint_helpers"])
+    if native_options["optimizer_ms"] is None:
+        os.environ.pop("SANTA2026_OPTIMIZER_MS", None)
+    else:
+        os.environ["SANTA2026_OPTIMIZER_MS"] = str(native_options["optimizer_ms"])
     if mitm_binary:
         os.environ["SANTA2026_MITM_BINARY"] = mitm_binary
+    if joint_binary:
+        os.environ["SANTA2026_JOINT_BINARY"] = joint_binary
+    else:
+        os.environ.pop("SANTA2026_JOINT_BINARY", None)
     global WORKER_CANDIDATES
     WORKER_CANDIDATES = [read_submission(path) for path in candidates]
 
@@ -123,6 +147,7 @@ def _evaluate(task):
             "milp": ("milp", "optimize_milp"),
             "polish": ("beam", "polish_beam"),
             "recombine": ("recombine", "optimize_recombine"),
+            "rustjoint": ("rust_joint", "optimize_rust_joint"),
             "mitm": ("mitm", "optimize_mitm"),
         }[strategy]
         function = getattr(importlib.import_module("santa2026." + module_name), function_name)
@@ -130,7 +155,7 @@ def _evaluate(task):
             started = time.monotonic()
             attempt = {"strategy": strategy, "seed": seed}
             try:
-                if strategy == "recombine":
+                if strategy in ("recombine", "rustjoint"):
                     sources = [best] + [source[puzzle.id] for source in WORKER_CANDIDATES]
                     sources = [[instruction[:] for instruction in program] for program in sources]
                     candidate = function(puzzle, sources, seed=seed, effort=effort)
@@ -158,14 +183,19 @@ def main(argv=None):
     parser.add_argument("--puzzles", type=Path, required=True)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--strategies", nargs="+", choices=("shared", "synthesis", "optimize", "factor", "beam", "milp", "polish", "recombine", "mitm"), required=True)
+    parser.add_argument("--strategies", nargs="+", choices=("shared", "synthesis", "optimize", "factor", "beam", "milp", "polish", "recombine", "rustjoint", "mitm"), required=True)
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
     parser.add_argument("--effort", type=int, default=1)
     parser.add_argument("--jobs", type=int, help="Default: 1 for mode-6 repair; up to 8 otherwise")
     parser.add_argument("--sample", type=int, default=100, help="0 evaluates all puzzles")
+    parser.add_argument("--ids-file", type=Path, help="JSON list of exact puzzle IDs; overrides --sample")
     parser.add_argument("--beam-binary", type=Path)
     parser.add_argument("--repair-binary", type=Path, help="Override the default mode-6 repair engine")
     parser.add_argument("--mitm-binary", type=Path)
+    parser.add_argument("--joint-binary", type=Path, help="Override the Rust joint-recipe optimizer")
+    parser.add_argument("--joint-helpers", type=int, help="0..24; defaults to SANTA2026_JOINT_HELPERS or 0")
+    parser.add_argument("--optimizer-ms", type=int, help="Native structural-search deadline; defaults to SANTA2026_OPTIMIZER_MS")
+    parser.add_argument("--optimizer-boundary", type=int, choices=(0, 1), help="Prioritize exact retained cut boundary")
     parser.add_argument("--beam-mode", type=int, choices=(0, 1, 2, 3, 4), default=0)
     parser.add_argument("--repair-mode", type=int, choices=(6, 7, 8, 9), default=6)
     parser.add_argument("--repair-trials", type=int, default=12)
@@ -173,10 +203,21 @@ def main(argv=None):
     parser.add_argument("--candidates", nargs="*", type=Path, default=[])
     parser.add_argument("--resume-frozen", action="store_true", help="Resume the saved source/binary even if the checkout changed")
     args = parser.parse_args(argv)
+    try:
+        args.joint_helpers = args.joint_helpers if args.joint_helpers is not None else int(os.environ.get("SANTA2026_JOINT_HELPERS", "0"))
+        args.optimizer_boundary = args.optimizer_boundary if args.optimizer_boundary is not None else int(os.environ.get("SANTA2026_OPTIMIZER_BOUNDARY", "0"))
+        if args.optimizer_ms is None and os.environ.get("SANTA2026_OPTIMIZER_MS") is not None:
+            args.optimizer_ms = int(os.environ["SANTA2026_OPTIMIZER_MS"])
+    except ValueError:
+        parser.error("native options must be integers")
+    if not 0 <= args.joint_helpers <= 24 or args.optimizer_boundary not in (0, 1):
+        parser.error("joint-helpers must be 0..24 and optimizer-boundary must be 0 or 1")
+    if args.optimizer_ms is not None and not 1 <= args.optimizer_ms <= 600000:
+        parser.error("optimizer-ms must be 1..600000")
     if args.jobs is None:
         # The native repair dictionary can have a much larger RSS than the
         # Python constructions. Let explicit --jobs opt into parallel repair.
-        args.jobs = 1 if "polish" in args.strategies and args.repair_mode == 6 else min(os.cpu_count() or 1, 8)
+        args.jobs = 1 if "rustjoint" in args.strategies or ("polish" in args.strategies and args.repair_mode == 6) else min(os.cpu_count() or 1, 8)
     if min(args.jobs, args.effort, args.repair_trials, args.repair_passes) < 1:
         parser.error("jobs, effort and repair budgets must be positive")
     started = time.monotonic()
@@ -184,6 +225,17 @@ def main(argv=None):
     baseline = read_submission(args.baseline)
     costs = score_submission(puzzles, baseline)
     selected = select_puzzles(puzzles, costs, args.sample)
+    if args.ids_file:
+        identifiers = json.loads(args.ids_file.read_text())
+        if not isinstance(identifiers, list) or any(not isinstance(item, str) for item in identifiers):
+            raise ValueError("ids-file must contain a JSON list of puzzle IDs")
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("ids-file contains duplicate puzzle IDs")
+        lookup = {puzzle.id: puzzle for puzzle in puzzles}
+        missing = set(identifiers) - set(lookup)
+        if missing:
+            raise ValueError("ids-file contains unknown puzzle IDs: " + ", ".join(sorted(missing)))
+        selected = [lookup[identifier] for identifier in identifiers]
     if not selected:
         raise ValueError("no puzzles selected")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -194,6 +246,9 @@ def main(argv=None):
         "python_version": sys.version.split()[0],
     }
     configuration["dependency_versions"] = {}
+    if "polish" in args.strategies or "rustjoint" in args.strategies:
+        configuration["native_options"] = {"optimizer_ms": args.optimizer_ms,
+            "optimizer_boundary": args.optimizer_boundary, "joint_helpers": args.joint_helpers}
     for dependency in ("numpy", "scipy", "ortools"):
         try:
             configuration["dependency_versions"][dependency] = importlib.metadata.version(dependency)
@@ -262,6 +317,17 @@ def main(argv=None):
                 shutil.copy2(original_mitm, frozen_mitm)
             if _hash(frozen_mitm) != digest:
                 raise ValueError("exact-search binary changed while snapshotting")
+        if "rustjoint" in args.strategies:
+            from santa2026.rust_joint import binary_path as joint_binary_path
+            original_joint = args.joint_binary.resolve() if args.joint_binary else joint_binary_path()
+            digest = _hash(original_joint)
+            configuration["joint_binary_sha256"] = digest
+            frozen_joint = args.output / "binaries" / digest
+            frozen_joint.parent.mkdir(exist_ok=True)
+            if not frozen_joint.exists():
+                shutil.copy2(original_joint, frozen_joint)
+            if _hash(frozen_joint) != digest:
+                raise ValueError("joint-recipe binary changed while snapshotting")
         signature = hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
         _atomic_json(args.output / "manifest.json", dict(configuration, signature=signature))
     candidate_files = []
@@ -296,11 +362,13 @@ def main(argv=None):
     beam_binary = str(executable) if executable else None
     repair_binary = str((args.output / "binaries" / configuration["repair_binary_sha256"]).resolve()) if "repair_binary_sha256" in configuration else None
     mitm_binary = str((args.output / "binaries" / configuration["mitm_binary_sha256"]).resolve()) if "mitm" in args.strategies else None
+    joint_binary = str((args.output / "binaries" / configuration["joint_binary_sha256"]).resolve()) if "joint_binary_sha256" in configuration else None
     worker_failure = None
     try:
         with concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs, initializer=_initialize,
                 initargs=(str(snapshot.resolve()), beam_binary, args.beam_mode,
-                          args.repair_mode, args.repair_trials, args.repair_passes, candidate_files, mitm_binary, repair_binary)) as pool:
+                          args.repair_mode, args.repair_trials, args.repair_passes, candidate_files, mitm_binary, repair_binary, joint_binary,
+                          configuration.get("native_options", DEFAULT_NATIVE_OPTIONS))) as pool:
             futures = [pool.submit(_evaluate, task) for task in pending]
             for future in concurrent.futures.as_completed(futures):
                 record = future.result()

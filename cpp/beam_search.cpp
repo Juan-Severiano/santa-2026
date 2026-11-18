@@ -8,6 +8,9 @@
 // choose the cheapest arithmetic plan, and compile in that selected target order.
 // Additional modes expose deterministic target-order experiments.
 // Mode 6 repairs an input program's graph and keeps only shorter compiled results.
+// Mode 7 also repairs internal hubs, ranked by measured full-program ablation cost.
+// Mode 8 rebuilds complete exclusive ancestor cones against an exact outside cut.
+// Mode 9 jointly destroys/replans groups of 6-10 outputs around the retained DAG.
 // Original and parameterized notebooks are Apache-2.0 licensed; see
 // licenses/Apache-2.0.txt and THIRD_PARTY.md for attribution and license details.
 #include <algorithm>
@@ -107,6 +110,8 @@ struct Dictionary {
             add(a / b, i, j, '/', cost);
         if (b > a && b % a == 0)
             add(b / a, j, i, '/', cost);
+        if ((ORDER_MODE == 7 || ORDER_MODE == 8) && a == b)
+            add(1, i, j, '/', cost);
     }
     void build(const vector<Int> &leaves) {
         index.clear();
@@ -616,35 +621,188 @@ struct Puzzle {
                 visit(visit, target);
             }
             vector<pair<int, Int>> ranked;
-            for (Int target : targets) {
-                if (!args.count(target))
-                    continue;
-                int exclusive = 0;
-                for (Int value : ancestors[target])
-                    if (args.count(value) && target_uses[value] == 1)
-                        ++exclusive;
-                ranked.push_back({-exclusive, target});
+            if (ORDER_MODE == 7 || ORDER_MODE == 8) {
+                set<Int> target_set(targets.begin(), targets.end());
+                map<Int, int> tree_cost;
+                auto estimate = [&](auto &&self, Int value) -> int {
+                    auto cached = tree_cost.find(value);
+                    if (cached != tree_cost.end())
+                        return cached->second;
+                    auto operands = args.find(value);
+                    if (operands == args.end())
+                        return tree_cost[value] = 0;
+                    auto [a, b] = operands->second;
+                    int cost = 1 + self(self, a) + (a == b ? 0 : self(self, b));
+                    return tree_cost[value] = min(10000, cost);
+                };
+                vector<pair<int, Int>> coarse;
+                for (auto &[value, operands] : args)
+                    if (target_uses[value]) {
+                        int priority = estimate(estimate, value) * min(4, target_uses[value]);
+                        coarse.push_back({-priority, value});
+                    }
+                sort(coarse.begin(), coarse.end());
+                size_t pool_limit = min(size_t(512), size_t(max(64, REPAIR_TRIALS * 8)));
+                if (coarse.size() > pool_limit)
+                    coarse.resize(pool_limit);
+                int current_cost = best_program.size();
+                try {
+                    current_cost = compile().size();
+                } catch (const exception &) {
+                }
+                // A free extra seed is a relaxation, used only to rank hubs.
+                // Real replacements still pay every operation and register.
+                for (auto [priority, value] : coarse) {
+                    if (starts.size() >= 48)
+                        break;
+                    Puzzle ablated = *this;
+                    ablated.starts.push_back(value);
+                    ablated.args.erase(value);
+                    try {
+                        int removed = current_cost - int(ablated.compile().size());
+                        if (removed > 1)
+                            ranked.push_back({-(removed * 8 + min(7, fanout[value])), value});
+                    } catch (const exception &) {
+                    }
+                }
+                sort(ranked.begin(), ranked.end());
+                if (ORDER_SEED % 3 == 1) {
+                    size_t exploration = min(ranked.size(), size_t(max(16, REPAIR_TRIALS * 3)));
+                    shuffle(ranked.begin(), ranked.begin() + exploration, generator);
+                } else if (ORDER_SEED % 3 == 2) {
+                    stable_sort(ranked.begin(), ranked.end(), [&](auto a, auto b) {
+                        return make_pair(target_uses[a.second], -a.first) >
+                               make_pair(target_uses[b.second], -b.first);
+                    });
+                }
+                vector<pair<int, Int>> hubs, outputs;
+                for (auto candidate : ranked)
+                    (target_set.count(candidate.second) ? outputs : hubs).push_back(candidate);
+                ranked.clear();
+                size_t hub_budget = min(hubs.size(), size_t((REPAIR_TRIALS * 3 + 3) / 4));
+                ranked.insert(ranked.end(), hubs.begin(), hubs.begin() + hub_budget);
+                size_t output_budget = min(outputs.size(), size_t(REPAIR_TRIALS) - hub_budget);
+                ranked.insert(ranked.end(), outputs.begin(), outputs.begin() + output_budget);
+                for (size_t index = hub_budget; index < hubs.size() && ranked.size() < size_t(REPAIR_TRIALS); ++index)
+                    ranked.push_back(hubs[index]);
+                for (size_t index = output_budget; index < outputs.size() && ranked.size() < size_t(REPAIR_TRIALS); ++index)
+                    ranked.push_back(outputs[index]);
+            } else {
+                for (Int target : targets) {
+                    if (!args.count(target))
+                        continue;
+                    int exclusive = 0;
+                    for (Int value : ancestors[target])
+                        if (args.count(value) && target_uses[value] == 1)
+                            ++exclusive;
+                    ranked.push_back({-exclusive, target});
+                }
+                sort(ranked.begin(), ranked.end());
+                if (ORDER_SEED % 3 == 1)
+                    shuffle(ranked.begin(), ranked.end(), generator);
+                else if (ORDER_SEED % 3 == 2)
+                    stable_sort(ranked.begin(), ranked.end(), [&](auto a, auto b) {
+                        return ancestors[a.second].size() > ancestors[b.second].size();
+                    });
             }
-            sort(ranked.begin(), ranked.end());
-            if (ORDER_SEED % 3 == 1)
-                shuffle(ranked.begin(), ranked.end(), generator);
-            else if (ORDER_SEED % 3 == 2)
-                stable_sort(ranked.begin(), ranked.end(), [&](auto a, auto b) {
-                    return ancestors[a.second].size() > ancestors[b.second].size();
-                });
             size_t attempts = min(ranked.size(), size_t(REPAIR_TRIALS));
             bool improved = false;
             for (size_t attempt = 0; attempt < attempts; ++attempt) {
                 Int target = ranked[attempt].second;
                 set<Int> blocked = descendants(target);
+                set<Int> outside;
+                vector<Int> cut_boundary;
+                if (ORDER_MODE == 8) {
+                    // All values still required when this hub is treated as a
+                    // free input are truly shared with the outside program.
+                    // The other ancestors form the full removable cone. This
+                    // includes diamonds whose nodes have several uses inside
+                    // the cone, unlike a fanout-one/depth-limited tree cut.
+                    auto visit_outside = [&](auto &&self, Int value) -> void {
+                        if (!outside.insert(value).second || value == target)
+                            return;
+                        auto found = args.find(value);
+                        if (found != args.end()) {
+                            self(self, found->second.first);
+                            self(self, found->second.second);
+                        }
+                    };
+                    for (Int output : targets)
+                        visit_outside(visit_outside, output);
+                    set<Int> cone;
+                    auto visit_cone = [&](auto &&self, Int value) -> void {
+                        if (value != target && outside.count(value)) {
+                            cut_boundary.push_back(value);
+                            return;
+                        }
+                        if (!cone.insert(value).second)
+                            return;
+                        auto found = args.find(value);
+                        if (found != args.end()) {
+                            self(self, found->second.first);
+                            self(self, found->second.second);
+                        } else {
+                            // Initial inputs remain available without cost.
+                            outside.insert(value);
+                            cut_boundary.push_back(value);
+                        }
+                    };
+                    visit_cone(visit_cone, target);
+                    for (Int value : cone)
+                        if (args.count(value)) {
+                            auto excluded = descendants(value);
+                            blocked.insert(excluded.begin(), excluded.end());
+                        }
+                }
+                if (ORDER_MODE == 7) {
+                    // Do not expose an expensive original operand as a free
+                    // dictionary leaf: that makes the old one-step root recipe
+                    // an immediate terminal and prevents context rewriting.
+                    map<Int, int> live_fanout;
+                    for (auto &[value, operands] : args)
+                        if (target_uses[value]) {
+                            ++live_fanout[operands.first];
+                            if (operands.first != operands.second)
+                                ++live_fanout[operands.second];
+                        }
+                    set<Int> required_targets(targets.begin(), targets.end());
+                    vector<Int> frontier{target};
+                    set<Int> roots{target};
+                    int context_depth = 3 + int(ORDER_SEED % 3);
+                    for (int depth = 0; depth < context_depth && !frontier.empty(); ++depth) {
+                        vector<Int> following;
+                        for (Int root : frontier) {
+                            auto operands = args.find(root);
+                            if (operands == args.end())
+                                continue;
+                            for (Int parent : {operands->second.first, operands->second.second})
+                                if (args.count(parent) && !required_targets.count(parent) &&
+                                    live_fanout[parent] == 1 && roots.insert(parent).second) {
+                                    following.push_back(parent);
+                                    auto excluded = descendants(parent);
+                                    blocked.insert(excluded.begin(), excluded.end());
+                                }
+                        }
+                        frontier = std::move(following);
+                    }
+                }
                 vector<Int> leaves;
                 set<Int> used;
                 auto add = [&](Int value) {
-                    if (defs.count(value) && !blocked.count(value) && used.insert(value).second)
+                    if (defs.count(value) && !blocked.count(value) &&
+                        (ORDER_MODE != 8 || outside.count(value) ||
+                         find(starts.begin(), starts.end(), value) != starts.end()) &&
+                        used.insert(value).second)
                         leaves.push_back(value);
                 };
                 for (Int value : starts)
                     add(value);
+                if (ORDER_MODE == 8) {
+                    sort(cut_boundary.begin(), cut_boundary.end(), greater<Int>());
+                    for (Int value : cut_boundary)
+                        if (int(leaves.size()) < N_RECENT)
+                            add(value);
+                }
                 add(1);
                 for (int exponent : {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32, 40, 48})
                     add(Int(1) << exponent);
@@ -701,6 +859,200 @@ struct Puzzle {
                     }
                 } catch (const exception &) {
                     // Preserve the validated hint when allocation cannot fit.
+                }
+            }
+            if (!improved)
+                break;
+        }
+        return best_program;
+    }
+    vector<array<int, 4>> polish_tail_hint(const vector<array<int, 4>> &hint) {
+        load_hint(hint);
+        auto best_program = hint;
+        try {
+            auto normalized = compile();
+            if (normalized.size() < best_program.size())
+                best_program = std::move(normalized);
+        } catch (const exception &) {
+            // Some valid hints overwrite all seeds; the protected-seed
+            // allocator cannot always reproduce those and must retain them.
+        }
+        mt19937_64 generator(ORDER_SEED ^ 0x9e3779b97f4a7c15ULL);
+        for (int pass = 0; pass < REPAIR_PASSES; ++pass) {
+            bool improved = false;
+            for (int attempt = 0; attempt < REPAIR_TRIALS; ++attempt) {
+                // Restore the accepted instruction stream so every trial sees
+                // a compact, acyclic graph without stale discarded recipes.
+                load_hint(best_program);
+                set<Int> required(targets.begin(), targets.end()), seen;
+                vector<Int> completion;
+                auto add_output = [&](Int value) {
+                    if (required.count(value) && seen.insert(value).second)
+                        completion.push_back(value);
+                };
+                for (Int value : starts)
+                    add_output(value);
+                for (Int value : order)
+                    add_output(value);
+                for (Int value : targets)
+                    add_output(value);
+                if (completion.empty())
+                    return best_program;
+                size_t group_size = min(completion.size(), size_t(6 + (attempt + ORDER_SEED) % 5));
+                vector<Int> chosen;
+                if (attempt % 3 == 2) {
+                    chosen = completion;
+                    shuffle(chosen.begin(), chosen.end(), generator);
+                    chosen.resize(group_size);
+                } else {
+                    size_t offset = completion.size() - group_size;
+                    if (attempt % 3 == 1 && offset)
+                        offset = generator() % (offset + 1);
+                    chosen.assign(completion.begin() + offset, completion.begin() + offset + group_size);
+                }
+                set<Int> removed_outputs(chosen.begin(), chosen.end());
+                vector<Int> prefix;
+                for (Int value : completion)
+                    if (!removed_outputs.count(value))
+                        prefix.push_back(value);
+                set<Int> outside(starts.begin(), starts.end());
+                auto visit = [&](auto &&self, Int value) -> void {
+                    if (!outside.insert(value).second)
+                        return;
+                    auto operands = args.find(value);
+                    if (operands != args.end()) {
+                        self(self, operands->second.first);
+                        self(self, operands->second.second);
+                    }
+                };
+                for (Int value : prefix)
+                    visit(visit, value);
+                Puzzle trial = *this;
+                for (auto it = trial.defs.begin(); it != trial.defs.end();)
+                    if (!outside.count(it->first))
+                        it = trial.defs.erase(it);
+                    else
+                        ++it;
+                for (auto it = trial.args.begin(); it != trial.args.end();)
+                    if (!outside.count(it->first))
+                        it = trial.args.erase(it);
+                    else
+                        ++it;
+                trial.order.erase(remove_if(trial.order.begin(), trial.order.end(),
+                                            [&](Int value) { return !outside.count(value); }),
+                                  trial.order.end());
+                trial.targets = prefix;
+                vector<Int> schedule = prefix, pending = chosen;
+                if ((attempt + ORDER_SEED) % 2)
+                    shuffle(pending.begin(), pending.end(), generator);
+                try {
+                    // Only retained values are genuinely free. Eagerly adding
+                    // the usual palette makes an unused 2 or 3 appear free and
+                    // can hide a cheaper doubling/addition behind x*2/x*3.
+                    // The dictionary itself constructs one/two-step constants;
+                    // one shared unit is the sole optional initial investment.
+                    trial.palette.clear();
+                    if (!trial.defs.count(1))
+                        trial.make('/', starts[0], starts[0]);
+                    trial.palette.push_back(1);
+                    for (int exponent : {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32, 40, 48})
+                        if (trial.defs.count(Int(1) << exponent))
+                            trial.palette.push_back(Int(1) << exponent);
+                    for (int value : {3, 5, 7, 9, 11, 13, 15, 17, 19, 23, 31})
+                        if (trial.defs.count(value))
+                            trial.palette.push_back(value);
+                    Dictionary dictionary(limit);
+                    bool viable = true;
+                    while (!pending.empty()) {
+                        for (auto it = pending.begin(); it != pending.end();)
+                            if (trial.defs.count(*it)) {
+                                schedule.push_back(*it);
+                                it = pending.erase(it);
+                            } else
+                                ++it;
+                        if (pending.empty())
+                            break;
+                        vector<Int> leaves;
+                        set<Int> used;
+                        auto add = [&](Int value) {
+                            if (trial.defs.count(value) && used.insert(value).second)
+                                leaves.push_back(value);
+                        };
+                        for (Int value : trial.palette)
+                            add(value);
+                        for (Int value : starts)
+                            add(value);
+                        for (auto it = schedule.rbegin(); it != schedule.rend() && int(leaves.size()) < N_DONE; ++it)
+                            add(*it);
+                        for (auto it = trial.order.rbegin(); it != trial.order.rend() && int(leaves.size()) < N_RECENT; ++it)
+                            add(*it);
+                        dictionary.build(leaves);
+                        unique_ptr<Puzzle> selected;
+                        size_t selected_index = 0;
+                        double best_rank = 1e30;
+                        for (size_t index = 0; index < pending.size(); ++index) {
+                            Search search(dictionary, width);
+                            search.run(pending[index]);
+                            Puzzle candidate = trial;
+                            if (search.end < 0)
+                                candidate.binary(pending[index]);
+                            else
+                                candidate.reconstruct(dictionary, search, pending[index]);
+                            candidate.targets = schedule;
+                            candidate.targets.push_back(pending[index]);
+                            try {
+                                auto partial = candidate.compile();
+                                // Register reload counts are not a monotone
+                                // bound as more future uses become known.
+                                // Only the distinct required arithmetic nodes
+                                // give a safe lower bound for this prefix DAG.
+                                set<Int> active(candidate.starts.begin(), candidate.starts.end());
+                                size_t arithmetic_nodes = 0;
+                                auto count = [&](auto &&self, Int value) -> void {
+                                    if (!active.insert(value).second)
+                                        return;
+                                    auto operands = candidate.args.find(value);
+                                    if (operands == candidate.args.end())
+                                        throw runtime_error("incomplete tail prefix");
+                                    ++arithmetic_nodes;
+                                    self(self, operands->second.first);
+                                    self(self, operands->second.second);
+                                };
+                                for (Int output : candidate.targets)
+                                    count(count, output);
+                                if (arithmetic_nodes >= best_program.size())
+                                    continue;
+                                int covered = 0;
+                                for (Int value : pending)
+                                    covered += candidate.defs.count(value);
+                                double rank = partial.size() - .4 * covered + .0001 * search.best;
+                                if (rank < best_rank) {
+                                    best_rank = rank;
+                                    selected_index = index;
+                                    selected = make_unique<Puzzle>(std::move(candidate));
+                                }
+                            } catch (const exception &) {
+                            }
+                        }
+                        if (!selected) {
+                            viable = false;
+                            break;
+                        }
+                        schedule.push_back(pending[selected_index]);
+                        pending.erase(pending.begin() + selected_index);
+                        trial = std::move(*selected);
+                    }
+                    if (!viable)
+                        continue;
+                    trial.targets = schedule;
+                    auto candidate = trial.compile();
+                    if (candidate.size() < best_program.size()) {
+                        best_program = std::move(candidate);
+                        improved = true;
+                    }
+                } catch (const exception &) {
+                    // A failed neighborhood cannot invalidate the accepted
+                    // program. All trial construction happens on a copy.
                 }
             }
             if (!improved)
@@ -798,7 +1150,7 @@ int main(int argc, char **argv) try {
         for (auto &x : p.targets)
             cin >> x;
         vector<array<int, 4>> prog;
-        if (ORDER_MODE == 6) {
+        if (ORDER_MODE == 6 || ORDER_MODE == 7 || ORDER_MODE == 8 || ORDER_MODE == 9) {
             int count;
             if (!(cin >> count) || count < 0 || count > 4096)
                 throw runtime_error("invalid hint instruction count");
@@ -810,7 +1162,7 @@ int main(int argc, char **argv) try {
                     throw runtime_error("truncated hint program");
                 hint.push_back({operation, left, right, destination});
             }
-            prog = p.polish_hint(hint);
+            prog = ORDER_MODE == 9 ? p.polish_tail_hint(hint) : p.polish_hint(hint);
         } else {
             p.solve();
             prog = p.compile();

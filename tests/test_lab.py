@@ -1,5 +1,8 @@
 import importlib.util
+import hashlib
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +16,50 @@ _spec.loader.exec_module(lab)
 
 
 class LabTests(unittest.TestCase):
+    def frozen_fixture(self, root):
+        expected = {"puzzles_sha256": "data", "baseline_sha256": "baseline",
+                    "strategies": ["shared"], "seeds": [0], "effort": 1, "selected_ids": ["toy"]}
+        hashes = {"santa2026/example.py": hashlib.sha256(b"pass\n").hexdigest()}
+        configuration = dict(expected, source_hashes=hashes)
+        signature = hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
+        code_id = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()[:16]
+        snapshot = root / "code" / code_id
+        (snapshot / "santa2026").mkdir(parents=True)
+        (snapshot / "santa2026/example.py").write_bytes(b"pass\n")
+        (root / "manifest.json").write_text(json.dumps(dict(configuration, signature=signature)))
+        return expected, snapshot
+
+    def test_frozen_resume_reuses_exact_saved_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected, snapshot = self.frozen_fixture(root)
+            configuration, signature, loaded, executable = lab._load_frozen(root, expected)
+            self.assertEqual(loaded, snapshot)
+            self.assertIsNone(executable)
+            self.assertEqual(configuration["strategies"], ["shared"])
+
+    def test_frozen_resume_rejects_tampering_and_different_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected, snapshot = self.frozen_fixture(root)
+            with self.assertRaisesRegex(ValueError, "baseline_sha256"):
+                lab._load_frozen(root, dict(expected, baseline_sha256="other input"))
+            (snapshot / "santa2026/example.py").write_text("changed\n")
+            with self.assertRaisesRegex(ValueError, "damaged"):
+                lab._load_frozen(root, expected)
+
+    def test_frozen_resume_rejects_missing_repair_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected, _ = self.frozen_fixture(root)
+            configuration = json.loads((root / "manifest.json").read_text())
+            configuration.pop("signature")
+            configuration["repair_binary_sha256"] = "missing-repair"
+            signature = hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
+            (root / "manifest.json").write_text(json.dumps(dict(configuration, signature=signature)))
+            with self.assertRaisesRegex(ValueError, "repair binary"):
+                lab._load_frozen(root, expected)
+
     def test_sample_spans_cost_distribution_without_duplicates(self):
         puzzles = [Puzzle(str(i), (1,), (1,), 1) for i in range(1000)]
         costs = {p.id: ValidationResult(int(p.id), 1) for p in puzzles}

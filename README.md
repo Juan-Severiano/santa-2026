@@ -28,8 +28,14 @@ Separar as rodadas permite reaproveitar o baseline e executar apenas a variaçã
 
 ## Resultados e checkpoints em 18/11/2026
 
-**Checkpoint atual no Kaggle: 159.737 instruções**, submissão **58512481**, aceita e pontuada.
-Esse portfólio parte dos **160.175** programas públicos de konbu17 e acrescenta **438 instruções de
+**Checkpoint atual no Kaggle: 144.213 instruções**, submissão **58519516**, aceita e pontuada.
+O portfólio parte da referência pública Apache-2.0 de Hanif versão 4 (**144.248**) e incorpora
+**35 instruções de economia** de experimentos locais, incluindo o reparo em Rust.
+O CSV enviado é `outputs/rust-main-submission.csv`, SHA-256
+`39df138984fd17e02770d15a6a545bebdc84ee1a136951996f7dc2c9ff9c93a8`.
+Os 1.000 programas passaram no replay e a pontuação oficial coincidiu com a previsão local.
+
+O checkpoint anterior, **159.737**, submissão **58512481**, parte dos **160.175** programas públicos de konbu17 e acrescenta **438 instruções de
 economia** por MILP, replanejamento C++ e compressão próprios. A origem Apache-2.0 está documentada
 em [THIRD_PARTY.md](THIRD_PARTY.md). A construção exclusivamente própria chegou a 233.968.
 
@@ -76,8 +82,9 @@ Este método fornece um baseline construtivo e determinístico. Não há garanti
 
 ## Laboratório de busca
 
-O motor de busca pesada fica em `cpp/beam_search.cpp`, compilado em C++17 com otimização para a CPU
-local. Ele usa dicionários de expressões curtas, busca regressiva e variantes de ordem dos alvos.
+O motor principal de reparo fica em `rust/repair.rs`. A construção original e os outros modos
+experimentais ficam em `cpp/beam_search.cpp`, compilado em C++17 com otimização para a CPU local.
+Eles usam dicionários de expressões curtas, busca regressiva e variantes de ordem dos alvos.
 Python coordena processos, checkpoints, comparação de programas e validação exata. As origens Apache-2.0
 do código e dos programas públicos estão descritas em [THIRD_PARTY.md](THIRD_PARTY.md).
 
@@ -94,7 +101,7 @@ nos 48 registradores. `--seeds` seleciona parâmetros e ordens complementares. `
 
 `--sample 100` cobre uniformemente as faixas do custo do baseline. `--sample 0` avalia todos os puzzles.
 O relatório distingue a redução nos puzzles testados da nota do portfólio completo, que mantém o baseline
-nos demais. Cada execução salva cópias imutáveis do Python e do binário C++, seus hashes, checkpoints
+nos demais. Cada execução salva cópias imutáveis do Python e do executável nativo utilizado, seus hashes, checkpoints
 por puzzle e o CSV completo validado. Repetir o mesmo comando retoma checkpoints compatíveis.
 
 Outras estratégias disponíveis: `shared` (intermediários compartilhados), `synthesis` (bases variáveis),
@@ -102,16 +109,78 @@ Outras estratégias disponíveis: `shared` (intermediários compartilhados), `sy
 Para `milp`, instale o extra `lab`; o SciPy usa o solver HiGHS em C++. Sem SciPy, essa estratégia preserva
 o programa de entrada. Os comandos não enviam nada ao Kaggle nem ao GitHub.
 
-A estratégia `polish` usa o modo 6 do C++: importa um programa já válido, tenta substituir trechos de
+A estratégia `polish` usa o modo 6, por padrão em Rust: importa um programa já válido, tenta substituir trechos de
 seu grafo por construções mais curtas e aceita apenas programas completos menores. Exemplo:
 
 ```sh
-python3 scripts/lab.py --puzzles data/puzzles.csv --baseline outputs/checkpoint-submission.csv --output outputs/labs/repair-pilot --strategies polish milp optimize --seeds 0 1 --effort 1 --jobs 6 --sample 100
+python3 scripts/lab.py --puzzles data/puzzles.csv --baseline outputs/checkpoint-submission.csv --output outputs/labs/repair-pilot --strategies polish milp optimize --seeds 0 1 --effort 1 --jobs 1 --sample 100
 ```
 
 A construção própria chegou a **233.968 instruções** nos 1.000 puzzles. A referência pública Apache-2.0
 de konbu17 foi validada separadamente com **160.175**. Resultados que usam essa referência como fallback
 devem informar essa origem; esse número não é apresentado como ganho de construção própria.
+
+## Comparação entre C++, Rust e Go
+
+`rust/repair.rs` e `go/repair/main.go` implementam o mesmo reparo guiado do modo 6: dicionário de
+expressões, busca regressiva, substituição de grafos e alocação nos 48 registradores. As três versões
+recebem os mesmos puzzles e programas iniciais. Rust e Go implementam somente esse modo; os modos
+de construção e as outras experiências em C++ continuam separados.
+
+Rust é o motor padrão para novos reparos do modo 6. Ao aproveitar código C++ de novos notebooks,
+a preferência do projeto é portá-lo para Rust, preservando as condições de licença e a atribuição.
+Uma tradução de linguagem continua derivada da implementação de origem.
+
+```sh
+python3 scripts/build_native.py
+python3 scripts/compare_languages.py --puzzles data/puzzles.csv --baseline outputs/language-comparison/baseline.csv --engines cpp:outputs/bin/repair-cpp rust:outputs/bin/repair-rust go:outputs/bin/repair-go --output outputs/language-comparison/controlled --sample 100 --seeds 0 --width 3 --trials 12 --passes 1 --repeats 3 --budget-seconds 60
+```
+
+O builder precisa de Clang/GCC, Rust e Go; não instala ferramentas. Rust também pode ser indicado com
+`--rustc`, ou encontrado no toolchain isolado em `outputs/toolchains/rustup/toolchains/stable-*/bin/`.
+Cada build salva fonte congelada, versão do compilador, flags e hashes. O comparador executa um motor
+por vez, alterna a ordem nas três repetições e registra tempo, CPU e pico de memória. A verificação
+dos programas fica fora do tempo medido. Diferenças nos programas ou falta de repetibilidade impedem
+atribuir o resultado apenas à velocidade das implementações.
+
+O baseline congelado desta comparação tem **144.238 instruções**, partindo da referência pública
+Hanif versão 4 (**144.248**) e incorporando melhorias locais. Os 1.000 programas passaram no replay;
+esse arquivo é a entrada fixa dos testes, anterior ao checkpoint oficial de 144.213 no Kaggle.
+Os relatórios preservam o melhor programa válido por puzzle e mantêm os demais do baseline.
+
+Em 18/11/2026, três repetições de 100 puzzles com o mesmo modo 6, largura 3, 12 tentativas,
+uma passagem e seed 0 produziram programas idênticos nos três motores, sem divergências ou erros:
+
+| Motor | Tempo mediano | CPU mediana | Maior pico RSS |
+| --- | ---: | ---: | ---: |
+| C++ / Clang 21 | 24,488 s | 19,014 s | 60,4 MB |
+| Rust 1.100.0 | **19,256 s** | **14,628 s** | 289,5 MB |
+| Go 1.26.5 | 53,984 s | 44,030 s | 139,1 MB |
+
+Os programas reduziram o portfólio completo para **144.237**, mantendo o baseline nos puzzles não
+testados. Um treino de outro projeto usou nove workers durante parte das medições; os tempos refletem
+essa carga variável. As rodadas de 60 s por motor chegaram à mesma pontuação; C++/Rust cobriram os
+mesmos 100 pares puzzle/seed, e Go cobriu 71. Repetições da mesma seed foram contabilizadas à parte.
+Esses resultados descrevem este núcleo, os builds registrados e esta máquina. Rust foi adotado como
+padrão por decisão do usuário, com paridade comprovada e a menor mediana observada; o maior uso de
+memória deve orientar a quantidade de workers.
+
+O modo 6 começa com um worker quando `--jobs` é omitido. Uma rodada local com quatro workers
+perdeu um processo após 178 puzzles, com causa ainda não confirmada; os checkpoints foram preservados
+e a rodada foi concluída com o mesmo código/binário e um worker. `--jobs` continua disponível para testar
+paralelismo em condições de memória e carga conhecidas.
+
+A consolidação em Rust terminou os **1.000 puzzles**, nas configurações `seed 0` e `seed 1` do
+laboratório, com 12 tentativas e uma passagem. O resultado local é **144.213 instruções**, 25 a menos
+que o baseline congelado da comparação; 24 vieram da rodada completa, em 22 puzzles, e uma do piloto.
+Zero erros de candidatos. O CSV foi reaberto e validado integralmente após a cópia para
+`outputs/rust-main-submission.csv`, SHA-256
+`39df138984fd17e02770d15a6a545bebdc84ee1a136951996f7dc2c9ff9c93a8`.
+O Kaggle confirmou **144.213** na submissão **58519516**; a meta abaixo de 100.000 permanece aberta.
+
+`SANTA2026_REPAIR_BINARY=/caminho/do/binario` e `lab.py --repair-binary /caminho/do/binario` permitem
+escolher outro motor para o modo 6. O laboratório congela esse executável e verifica seu hash na
+retomada, separadamente do motor de construção.
 
 ## Validação
 
@@ -120,7 +189,7 @@ positividade, `value_limit`, fontes definidas, índices, cobertura acumulada dos
 4.096 instruções e 131.072 bytes UTF-8 por célula. A leitura exige exatamente as colunas `id,program`,
 IDs únicos e um programa JSON válido. Ao pontuar, exige os mesmos IDs do arquivo de puzzles fornecido.
 
-Os 77 testes passam, incluindo integração compilada em C++ e o laboratório. Eles cobrem o exemplo oficial de quatro instruções, operações inválidas, inteiros até `10^18`, leitura
+Os 118 testes passam, incluindo integração compilada, paridade C++/Rust/Go e o laboratório. Eles cobrem o exemplo oficial de quatro instruções, operações inválidas, inteiros até `10^18`, leitura
 antes de sobrescrita, cobertura depois de reciclar um alvo, serialização CSV/JSON, limites e puzzles aleatórios.
 O sample oficial passou nos 1.000 puzzles, com **1.490.379 instruções**. Uma comparação independente de
 10.000 programas aleatórios encontrou zero divergências entre o verificador e um segundo interpretador.

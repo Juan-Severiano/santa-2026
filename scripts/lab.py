@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+from concurrent.futures.process import BrokenProcessPool
 import hashlib
 import importlib
 import importlib.metadata
@@ -16,6 +17,7 @@ import time
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+WORKER_CANDIDATES = []
 sys.path.insert(0, str(REPOSITORY / "src"))
 
 from santa2026.core import (  # noqa: E402
@@ -34,6 +36,45 @@ def _hash(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _load_frozen(output, requested):
+    configuration = json.loads((output / "manifest.json").read_text())
+    signature = configuration.pop("signature")
+    if hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest() != signature:
+        raise ValueError("the saved experiment manifest is damaged")
+    for key in ("puzzles_sha256", "baseline_sha256", "strategies", "seeds", "effort", "selected_ids"):
+        if configuration.get(key) != requested[key]:
+            raise ValueError(f"frozen experiment does not match requested {key}")
+    for key in ("python_version", "dependency_versions", "beam_mode"):
+        if key in configuration and configuration[key] != requested.get(key):
+            raise ValueError(f"frozen experiment requires its original {key}")
+    if configuration.get("candidate_sha256", []) != requested.get("candidate_sha256", []):
+        raise ValueError("frozen experiment requires its original candidate programs")
+    for key in ("polish_mode", "repair_trials", "repair_passes"):
+        if key in configuration and configuration[key] != requested.get(key):
+            raise ValueError(f"frozen experiment requires its original {key}")
+    hashes = configuration["source_hashes"]
+    code_id = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()[:16]
+    snapshot = output / "code" / code_id
+    actual = {str(path.relative_to(snapshot)): _hash(path) for path in sorted(snapshot.rglob("*.py"))}
+    if actual != hashes:
+        raise ValueError("frozen Python source is missing or damaged")
+    executable = None
+    if "beam_binary_sha256" in configuration:
+        executable = output / "binaries" / configuration["beam_binary_sha256"]
+        if not executable.is_file() or _hash(executable) != configuration["beam_binary_sha256"]:
+            raise ValueError("frozen C++ binary is missing or damaged")
+        executable = executable.resolve()
+    if "mitm_binary_sha256" in configuration:
+        mitm_executable = output / "binaries" / configuration["mitm_binary_sha256"]
+        if not mitm_executable.is_file() or _hash(mitm_executable) != configuration["mitm_binary_sha256"]:
+            raise ValueError("frozen exact-search binary is missing or damaged")
+    if "repair_binary_sha256" in configuration:
+        repair_executable = output / "binaries" / configuration["repair_binary_sha256"]
+        if not repair_executable.is_file() or _hash(repair_executable) != configuration["repair_binary_sha256"]:
+            raise ValueError("frozen repair binary is missing or damaged")
+    return configuration, signature, snapshot, executable
+
+
 def select_puzzles(puzzles, costs, count):
     """Evenly sample the full distribution of baseline instruction counts."""
     ordered = sorted(puzzles, key=lambda puzzle: (costs[puzzle.id].instructions, puzzle.id))
@@ -45,14 +86,27 @@ def select_puzzles(puzzles, costs, count):
     return [ordered[((2 * index + 1) * len(ordered)) // (2 * count)] for index in range(count)]
 
 
-def _initialize(snapshot, beam_binary=None, beam_mode=0):
+def _initialize(snapshot, beam_binary=None, beam_mode=0, repair_mode=6, repair_trials=12, repair_passes=1, candidates=(), mitm_binary=None, repair_binary=None):
     # Each experiment runs immutable source copies even while a new strategy
     # is being developed in the main checkout. core's dataclasses stay shared.
     import santa2026
     santa2026.__path__.insert(0, str(Path(snapshot) / "santa2026"))
     if beam_binary:
         os.environ["SANTA2026_BEAM_BINARY"] = beam_binary
+    else:
+        os.environ.pop("SANTA2026_BEAM_BINARY", None)
+    if repair_binary:
+        os.environ["SANTA2026_REPAIR_BINARY"] = repair_binary
+    else:
+        os.environ.pop("SANTA2026_REPAIR_BINARY", None)
     os.environ["SANTA2026_BEAM_MODE"] = str(beam_mode)
+    os.environ["SANTA2026_REPAIR_MODE"] = str(repair_mode)
+    os.environ["SANTA2026_REPAIR_TRIALS"] = str(repair_trials)
+    os.environ["SANTA2026_REPAIR_PASSES"] = str(repair_passes)
+    if mitm_binary:
+        os.environ["SANTA2026_MITM_BINARY"] = mitm_binary
+    global WORKER_CANDIDATES
+    WORKER_CANDIDATES = [read_submission(path) for path in candidates]
 
 
 def _evaluate(task):
@@ -68,13 +122,19 @@ def _evaluate(task):
             "beam": ("beam", "solve_beam"),
             "milp": ("milp", "optimize_milp"),
             "polish": ("beam", "polish_beam"),
+            "recombine": ("recombine", "optimize_recombine"),
+            "mitm": ("mitm", "optimize_mitm"),
         }[strategy]
         function = getattr(importlib.import_module("santa2026." + module_name), function_name)
         for seed in seeds:
             started = time.monotonic()
             attempt = {"strategy": strategy, "seed": seed}
             try:
-                if strategy in ("optimize", "milp", "polish"):
+                if strategy == "recombine":
+                    sources = [best] + [source[puzzle.id] for source in WORKER_CANDIDATES]
+                    sources = [[instruction[:] for instruction in program] for program in sources]
+                    candidate = function(puzzle, sources, seed=seed, effort=effort)
+                elif strategy in ("optimize", "milp", "polish", "mitm"):
                     candidate = function(puzzle, [instruction[:] for instruction in best], seed=seed, effort=effort)
                 else:
                     candidate = function(puzzle, seed=seed, effort=effort)
@@ -98,16 +158,27 @@ def main(argv=None):
     parser.add_argument("--puzzles", type=Path, required=True)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--strategies", nargs="+", choices=("shared", "synthesis", "optimize", "factor", "beam", "milp", "polish"), required=True)
+    parser.add_argument("--strategies", nargs="+", choices=("shared", "synthesis", "optimize", "factor", "beam", "milp", "polish", "recombine", "mitm"), required=True)
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
     parser.add_argument("--effort", type=int, default=1)
-    parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 8))
+    parser.add_argument("--jobs", type=int, help="Default: 1 for mode-6 repair; up to 8 otherwise")
     parser.add_argument("--sample", type=int, default=100, help="0 evaluates all puzzles")
     parser.add_argument("--beam-binary", type=Path)
+    parser.add_argument("--repair-binary", type=Path, help="Override the default mode-6 repair engine")
+    parser.add_argument("--mitm-binary", type=Path)
     parser.add_argument("--beam-mode", type=int, choices=(0, 1, 2, 3, 4), default=0)
+    parser.add_argument("--repair-mode", type=int, choices=(6, 7, 8, 9), default=6)
+    parser.add_argument("--repair-trials", type=int, default=12)
+    parser.add_argument("--repair-passes", type=int, default=1)
+    parser.add_argument("--candidates", nargs="*", type=Path, default=[])
+    parser.add_argument("--resume-frozen", action="store_true", help="Resume the saved source/binary even if the checkout changed")
     args = parser.parse_args(argv)
-    if args.jobs < 1 or args.effort < 1:
-        parser.error("jobs and effort must be positive")
+    if args.jobs is None:
+        # The native repair dictionary can have a much larger RSS than the
+        # Python constructions. Let explicit --jobs opt into parallel repair.
+        args.jobs = 1 if "polish" in args.strategies and args.repair_mode == 6 else min(os.cpu_count() or 1, 8)
+    if min(args.jobs, args.effort, args.repair_trials, args.repair_passes) < 1:
+        parser.error("jobs, effort and repair budgets must be positive")
     started = time.monotonic()
     puzzles = read_puzzles(args.puzzles)
     baseline = read_submission(args.baseline)
@@ -116,44 +187,92 @@ def main(argv=None):
     if not selected:
         raise ValueError("no puzzles selected")
     args.output.mkdir(parents=True, exist_ok=True)
-    source = REPOSITORY / "src"
-    hashes = {str(path.relative_to(source)): _hash(path) for path in sorted((source / "santa2026").rglob("*.py"))}
-    code_id = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()[:16]
-    snapshot = args.output / "code" / code_id
-    if not snapshot.exists():
-        shutil.copytree(source / "santa2026", snapshot / "santa2026", ignore=shutil.ignore_patterns("__pycache__"))
-    snapshot_hashes = {str(path.relative_to(snapshot)): _hash(path) for path in sorted(snapshot.rglob("*.py"))}
-    if snapshot_hashes != hashes:
-        raise ValueError("source changed while snapshotting; rerun after the edit finishes")
     configuration = {
         "puzzles_sha256": _hash(args.puzzles), "baseline_sha256": _hash(args.baseline),
         "strategies": args.strategies, "seeds": args.seeds, "effort": args.effort,
-        "source_hashes": hashes, "selected_ids": [puzzle.id for puzzle in selected],
+        "selected_ids": [puzzle.id for puzzle in selected],
         "python_version": sys.version.split()[0],
     }
     configuration["dependency_versions"] = {}
-    for dependency in ("numpy", "scipy"):
+    for dependency in ("numpy", "scipy", "ortools"):
         try:
             configuration["dependency_versions"][dependency] = importlib.metadata.version(dependency)
         except importlib.metadata.PackageNotFoundError:
             configuration["dependency_versions"][dependency] = None
     if any(strategy in args.strategies for strategy in ("beam", "polish")):
-        from santa2026.beam import binary_path
-        executable = args.beam_binary.resolve() if args.beam_binary else binary_path()
-        binary_hash = _hash(executable)
-        configuration["beam_binary_sha256"] = binary_hash
-        frozen_executable = args.output / "binaries" / binary_hash
-        frozen_executable.parent.mkdir(exist_ok=True)
-        if not frozen_executable.exists():
-            shutil.copy2(executable, frozen_executable)
-        if _hash(frozen_executable) != binary_hash:
-            raise ValueError("binary changed while snapshotting; retry after compilation")
-        executable = frozen_executable.resolve()
         configuration["beam_mode"] = args.beam_mode
         if "polish" in args.strategies:
-            configuration["polish_mode"] = 6
-    signature = hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
-    _atomic_json(args.output / "manifest.json", dict(configuration, signature=signature))
+            configuration["polish_mode"] = args.repair_mode
+            configuration["repair_trials"] = args.repair_trials
+            configuration["repair_passes"] = args.repair_passes
+    if "mitm" in args.strategies:
+        configuration["repair_trials"] = args.repair_trials
+    candidate_hashes = []
+    for path in args.candidates:
+        score_submission(puzzles, read_submission(path))
+        candidate_hashes.append(_hash(path))
+    if candidate_hashes:
+        configuration["candidate_sha256"] = candidate_hashes
+    if args.resume_frozen:
+        configuration, signature, snapshot, executable = _load_frozen(args.output, configuration)
+    else:
+        source = REPOSITORY / "src"
+        hashes = {str(path.relative_to(source)): _hash(path) for path in sorted((source / "santa2026").rglob("*.py"))}
+        configuration["source_hashes"] = hashes
+        code_id = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()[:16]
+        snapshot = args.output / "code" / code_id
+        if not snapshot.exists():
+            shutil.copytree(source / "santa2026", snapshot / "santa2026", ignore=shutil.ignore_patterns("__pycache__"))
+        snapshot_hashes = {str(path.relative_to(snapshot)): _hash(path) for path in sorted(snapshot.rglob("*.py"))}
+        if snapshot_hashes != hashes:
+            raise ValueError("source changed while snapshotting; rerun after the edit finishes")
+        executable = None
+        if "beam" in args.strategies or ("polish" in args.strategies and args.repair_mode != 6):
+            from santa2026.beam import binary_path
+            original_binary = args.beam_binary.resolve() if args.beam_binary else binary_path()
+            binary_hash = _hash(original_binary)
+            configuration["beam_binary_sha256"] = binary_hash
+            executable = args.output / "binaries" / binary_hash
+            executable.parent.mkdir(exist_ok=True)
+            if not executable.exists():
+                shutil.copy2(original_binary, executable)
+            if _hash(executable) != binary_hash:
+                raise ValueError("binary changed while snapshotting; retry after compilation")
+            executable = executable.resolve()
+        if "polish" in args.strategies and args.repair_mode == 6:
+            from santa2026.beam import binary_path
+            original_repair = args.repair_binary or args.beam_binary or binary_path(repair=True)
+            original_repair = original_repair.resolve()
+            digest = _hash(original_repair)
+            configuration["repair_binary_sha256"] = digest
+            frozen_repair = args.output / "binaries" / digest
+            frozen_repair.parent.mkdir(exist_ok=True)
+            if not frozen_repair.exists():
+                shutil.copy2(original_repair, frozen_repair)
+            if _hash(frozen_repair) != digest:
+                raise ValueError("repair binary changed while snapshotting")
+        if "mitm" in args.strategies:
+            from santa2026.mitm import binary_path as mitm_binary_path
+            original_mitm = args.mitm_binary.resolve() if args.mitm_binary else mitm_binary_path()
+            digest = _hash(original_mitm)
+            configuration["mitm_binary_sha256"] = digest
+            frozen_mitm = args.output / "binaries" / digest
+            frozen_mitm.parent.mkdir(exist_ok=True)
+            if not frozen_mitm.exists():
+                shutil.copy2(original_mitm, frozen_mitm)
+            if _hash(frozen_mitm) != digest:
+                raise ValueError("exact-search binary changed while snapshotting")
+        signature = hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
+        _atomic_json(args.output / "manifest.json", dict(configuration, signature=signature))
+    candidate_files = []
+    for index, digest in enumerate(configuration.get("candidate_sha256", [])):
+        frozen_input = args.output / "inputs" / (digest + ".csv")
+        if not args.resume_frozen and not frozen_input.exists():
+            frozen_input.parent.mkdir(exist_ok=True)
+            shutil.copyfile(args.candidates[index], frozen_input)
+        if not frozen_input.is_file() or _hash(frozen_input) != digest:
+            raise ValueError("frozen candidate program file is missing or damaged")
+        candidate_files.append(str(frozen_input.resolve()))
     checkpoints = args.output / "checkpoints"
     best_programs = dict(baseline)
     records = {}
@@ -174,24 +293,33 @@ def main(argv=None):
             best_programs[puzzle.id] = record["program"]
     original_score = sum(item.instructions for item in costs.values())
     print(f"Selected {len(selected)}/{len(puzzles)} puzzles; resumed {len(records)}; workers={args.jobs}", flush=True)
-    beam_binary = str(executable) if any(strategy in args.strategies for strategy in ("beam", "polish")) else None
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs, initializer=_initialize,
-            initargs=(str(snapshot.resolve()), beam_binary, args.beam_mode)) as pool:
-        futures = [pool.submit(_evaluate, task) for task in pending]
-        for future in concurrent.futures.as_completed(futures):
-            record = future.result()
-            records[record["id"]] = record
-            best_programs[record["id"]] = record["program"]
-            _atomic_json(checkpoints / f"{record['id']}.json", record)
-            if len(records) % 10 == 0 or len(records) == len(selected):
-                saved = sum(r["baseline_instructions"] - r["instructions"] for r in records.values())
-                print(f"Completed {len(records)}/{len(selected)}; saved={saved}; full_portfolio={original_score-saved}", flush=True)
+    beam_binary = str(executable) if executable else None
+    repair_binary = str((args.output / "binaries" / configuration["repair_binary_sha256"]).resolve()) if "repair_binary_sha256" in configuration else None
+    mitm_binary = str((args.output / "binaries" / configuration["mitm_binary_sha256"]).resolve()) if "mitm" in args.strategies else None
+    worker_failure = None
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs, initializer=_initialize,
+                initargs=(str(snapshot.resolve()), beam_binary, args.beam_mode,
+                          args.repair_mode, args.repair_trials, args.repair_passes, candidate_files, mitm_binary, repair_binary)) as pool:
+            futures = [pool.submit(_evaluate, task) for task in pending]
+            for future in concurrent.futures.as_completed(futures):
+                record = future.result()
+                records[record["id"]] = record
+                best_programs[record["id"]] = record["program"]
+                _atomic_json(checkpoints / f"{record['id']}.json", record)
+                if len(records) % 10 == 0 or len(records) == len(selected):
+                    saved = sum(r["baseline_instructions"] - r["instructions"] for r in records.values())
+                    print(f"Completed {len(records)}/{len(selected)}; saved={saved}; full_portfolio={original_score-saved}", flush=True)
+    except BrokenProcessPool as exc:
+        worker_failure = str(exc)
+        print("A worker stopped. Saving validated progress; resume with --resume-frozen and fewer jobs.", flush=True)
     output_csv = args.output / "best.csv"
     write_submission(output_csv, best_programs)
     verified = score_submission(puzzles, read_submission(output_csv))
     final_score = sum(item.instructions for item in verified.values())
     report = {
-        "signature": signature, "puzzles": len(puzzles), "evaluated": len(selected),
+        "signature": signature, "puzzles": len(puzzles), "evaluated": len(records), "selected": len(selected),
+        "complete": len(records) == len(selected), "worker_failure": worker_failure,
         "baseline_score": original_score, "score": final_score,
         "instructions_saved": original_score - final_score,
         "selected_baseline_score": sum(len(baseline[p.id]) for p in selected),
@@ -202,14 +330,14 @@ def main(argv=None):
         "submission_sha256": _hash(output_csv),
         "per_puzzle": {puzzle.id: {
             "baseline": len(baseline[puzzle.id]), "best": len(best_programs[puzzle.id]),
-            "attempts": records[puzzle.id]["attempts"],
+            "attempts": records.get(puzzle.id, {}).get("attempts", []),
         } for puzzle in selected},
     }
     _atomic_json(args.output / "report.json", report)
     print(json.dumps({k: v for k, v in report.items() if k not in ("per_puzzle", "errors")}, indent=2), flush=True)
     if report["errors"]:
         print(f"Strategy failures: {len(report['errors'])}; see report.json", flush=True)
-    return 0
+    return 2 if worker_failure else 0
 
 
 if __name__ == "__main__":

@@ -1,12 +1,24 @@
+import os
+from pathlib import Path
 import subprocess
 import unittest
 from unittest.mock import patch
 
-from santa2026.beam import polish_beam, solve_beam
+from santa2026.beam import binary_path, polish_beam, solve_beam
 from santa2026.core import Puzzle
 
 
 class BeamInterfaceTests(unittest.TestCase):
+    def test_default_repair_path_matches_native_build_output(self):
+        with patch.dict(os.environ, {}, clear=True), patch("santa2026.beam.DEFAULT_REPAIR_ENGINE", "cpp"):
+            self.assertEqual(binary_path(repair=True).name, "repair-cpp")
+
+    def test_repair_override_is_separate_from_construction_engine(self):
+        with patch.dict(os.environ, {"SANTA2026_BEAM_BINARY": "/tmp/construction",
+                                    "SANTA2026_REPAIR_BINARY": "/tmp/repair"}):
+            self.assertEqual(binary_path(), Path("/tmp/construction").resolve())
+            self.assertEqual(binary_path(repair=True), Path("/tmp/repair").resolve())
+
     def test_line_protocol_does_not_depend_on_puzzle_id(self):
         puzzle = Puzzle("an id with spaces", (3,), (1,), 3)
         completed = subprocess.CompletedProcess([], 0, 'puzzle [["/",0,0,1]]\n', '')

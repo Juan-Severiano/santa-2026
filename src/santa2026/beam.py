@@ -1,4 +1,4 @@
-"""Validated interface to the public C++ dictionary/beam research baseline.
+"""Validated native search interface; mode-6 repair uses Rust by default.
 
 The original solver is by Tony Li; the parameterized portfolio is by konbu17:
 https://www.kaggle.com/code/tonylica/elf-calculator-with-register-reuse
@@ -18,12 +18,18 @@ from pathlib import Path
 from .core import Puzzle, validate_program
 
 
-def binary_path():
-    configured = os.environ.get("SANTA2026_BEAM_BINARY")
+DEFAULT_REPAIR_ENGINE = "rust"
+
+
+def binary_path(repair=False):
+    configured = os.environ.get("SANTA2026_REPAIR_BINARY") if repair else None
+    configured = configured or os.environ.get("SANTA2026_BEAM_BINARY")
     if configured:
         return Path(configured).resolve()
     for directory in Path(__file__).resolve().parents:
         if (directory / "pyproject.toml").is_file():
+            if repair:
+                return directory / "outputs" / "bin" / ("repair-" + DEFAULT_REPAIR_ENGINE)
             compiled = directory / "outputs" / "bin" / "beam"
             if compiled.is_file():
                 return compiled
@@ -51,7 +57,7 @@ def _invoke(puzzle, seed, effort, mode, hint=None):
     if not set(puzzle.targets) - set(puzzle.starting_values):
         return []
     if puzzle.registers != 48:
-        raise ValueError("The C++ engine requires exactly 48 registers")
+        raise ValueError("The native search engine requires exactly 48 registers")
     width, alpha, done, recent, bits, schedule_seed = _settings(seed, effort)
     # A fixed opaque identifier keeps the line protocol independent of CSV IDs.
     line = " ".join(map(str, ("puzzle", puzzle.value_limit, len(puzzle.starting_values),
@@ -59,14 +65,17 @@ def _invoke(puzzle, seed, effort, mode, hint=None):
     if hint is not None:
         line += str(len(hint)) + "\n"
         line += "\n".join(" ".join(map(str, instruction)) for instruction in hint) + "\n"
+    command = [str(binary_path(repair=(mode == 6))), str(width), str(alpha), str(done), str(recent), str(bits),
+               str(mode), str(schedule_seed)]
+    if hint is not None:
+        command += [os.environ.get("SANTA2026_REPAIR_TRIALS", "12"), os.environ.get("SANTA2026_REPAIR_PASSES", "1")]
     completed = subprocess.run(
-        [str(binary_path()), str(width), str(alpha), str(done), str(recent), str(bits),
-         str(mode), str(schedule_seed)],
+        command,
         input=line, text=True, capture_output=True, timeout=120 * max(1, effort), check=True,
     )
     identifier, cell = completed.stdout.strip().split(" ", 1)
     if identifier != "puzzle":
-        raise ValueError("Unexpected C++ solver response")
+        raise ValueError("Unexpected native solver response")
     program = json.loads(cell)
     validate_program(puzzle, program)
     return program
@@ -80,5 +89,5 @@ def solve_beam(puzzle: Puzzle, seed: int = 0, effort: int = 1):
 def polish_beam(puzzle: Puzzle, program, seed: int = 0, effort: int = 1):
     """Repair an existing program using its arithmetic graph as search context."""
     validate_program(puzzle, program)
-    candidate = _invoke(puzzle, seed, effort, 6, hint=program)
+    candidate = _invoke(puzzle, seed, effort, int(os.environ.get("SANTA2026_REPAIR_MODE", "6")), hint=program)
     return candidate if len(candidate) < len(program) else [instruction[:] for instruction in program]

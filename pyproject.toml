@@ -9,6 +9,9 @@ description = "Exact local validator and arithmetic-program solver for Kaggle Sa
 requires-python = ">=3.9"
 dependencies = []
 
+[project.optional-dependencies]
+lab = ["scipy>=1.11"]
+
 [project.scripts]
 santa2026 = "santa2026.cli:main"
 

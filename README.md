@@ -26,7 +26,19 @@ o resultado após a serialização. Os comandos são locais; não enviam submiss
 Sem `--strategy`, o solver usa `portfolio`, que compara as duas construções na mesma execução.
 Separar as rodadas permite reaproveitar o baseline e executar apenas a variação nova.
 
-## Resultados locais em 18/11/2026
+## Resultados e checkpoints em 18/11/2026
+
+**Checkpoint atual no Kaggle: 159.737 instruções**, submissão **58512481**, aceita e pontuada.
+Esse portfólio parte dos **160.175** programas públicos de konbu17 e acrescenta **438 instruções de
+economia** por MILP, replanejamento C++ e compressão próprios. A origem Apache-2.0 está documentada
+em [THIRD_PARTY.md](THIRD_PARTY.md). A construção exclusivamente própria chegou a 233.968.
+
+O CSV enviado está em `outputs/checkpoint-submission.csv`, com SHA-256
+`0b1d5d8f9c70b7a050138d33e921be0616632afe7774d6a227755118d0a58eb1`.
+Todos os 1.000 programas foram reexecutados localmente e a nota foi confirmada pelo Kaggle.
+A meta de menos de 100.000 permanece em pesquisa.
+
+A evolução inicial, anterior à incorporação da referência pública, foi:
 
 | Construção | Puzzles pontuados | Instruções | Maior programa |
 | --- | ---: | ---: | ---: |
@@ -43,7 +55,7 @@ Em 18/11/2026, o Kaggle aceitou a submissão **58510005** e confirmou a pontuaç
 **288.694**, igual à previsão local. A submissão corresponde ao SHA-256
 `304ade128eeeb382c25e61a3241fe400c03e442bfa4b0e1dc3b00ec168a05a77`.
 
-O arquivo final é `outputs/submission.csv`. Todos os programas passaram no replay local após o round-trip
+O arquivo da primeira versão é `outputs/submission.csv`. Todos os programas passaram no replay local após o round-trip
 CSV/JSON. `outputs/submission-report.json` contém os detalhes por puzzle, hashes SHA-256 dos dados,
 do CSV e do solver, versão do Python e falhas que exigiram fallback (nenhuma nesta rodada).
 
@@ -62,6 +74,45 @@ Extraia os três CSVs do ZIP nessa pasta. Dados, programas gerados e relatórios
 
 Este método fornece um baseline construtivo e determinístico. Não há garantia de ótimo global.
 
+## Laboratório de busca
+
+O motor de busca pesada fica em `cpp/beam_search.cpp`, compilado em C++17 com otimização para a CPU
+local. Ele usa dicionários de expressões curtas, busca regressiva e variantes de ordem dos alvos.
+Python coordena processos, checkpoints, comparação de programas e validação exata. As origens Apache-2.0
+do código e dos programas públicos estão descritas em [THIRD_PARTY.md](THIRD_PARTY.md).
+
+```sh
+python3 scripts/build_cpp.py
+python3 scripts/lab.py --puzzles data/puzzles.csv --baseline outputs/submission.csv --output outputs/labs/replan-pilot --strategies beam optimize --beam-mode 1 --seeds 0 1 --effort 1 --jobs 10 --sample 100
+python3 scripts/lab.py --puzzles data/puzzles.csv --baseline outputs/submission.csv --output outputs/labs/replan-full --strategies beam optimize --beam-mode 4 --seeds 0 1 --effort 1 --jobs 10 --sample 0
+python3 scripts/merge.py --puzzles data/puzzles.csv --output outputs/labs/merged.csv outputs/submission.csv outputs/labs/replan-full/best.csv
+```
+
+O modo 0 reproduz o planejamento original; o modo 1 escolhe o alvo mais barato a cada etapa; o modo 2
+varia a ordem; o modo 3 considera afinidade entre alvos; o modo 4 compara o custo do programa já alocado
+nos 48 registradores. `--seeds` seleciona parâmetros e ordens complementares. `--effort` aumenta a busca.
+
+`--sample 100` cobre uniformemente as faixas do custo do baseline. `--sample 0` avalia todos os puzzles.
+O relatório distingue a redução nos puzzles testados da nota do portfólio completo, que mantém o baseline
+nos demais. Cada execução salva cópias imutáveis do Python e do binário C++, seus hashes, checkpoints
+por puzzle e o CSV completo validado. Repetir o mesmo comando retoma checkpoints compatíveis.
+
+Outras estratégias disponíveis: `shared` (intermediários compartilhados), `synthesis` (bases variáveis),
+`factor` (fatorações próximas), `optimize` (compressão exata do grafo) e `milp` (seleção global de receitas).
+Para `milp`, instale o extra `lab`; o SciPy usa o solver HiGHS em C++. Sem SciPy, essa estratégia preserva
+o programa de entrada. Os comandos não enviam nada ao Kaggle nem ao GitHub.
+
+A estratégia `polish` usa o modo 6 do C++: importa um programa já válido, tenta substituir trechos de
+seu grafo por construções mais curtas e aceita apenas programas completos menores. Exemplo:
+
+```sh
+python3 scripts/lab.py --puzzles data/puzzles.csv --baseline outputs/checkpoint-submission.csv --output outputs/labs/repair-pilot --strategies polish milp optimize --seeds 0 1 --effort 1 --jobs 6 --sample 100
+```
+
+A construção própria chegou a **233.968 instruções** nos 1.000 puzzles. A referência pública Apache-2.0
+de konbu17 foi validada separadamente com **160.175**. Resultados que usam essa referência como fallback
+devem informar essa origem; esse número não é apresentado como ganho de construção própria.
+
 ## Validação
 
 O verificador usa inteiros do Python, sem ponto flutuante. Confere as quatro operações, divisão sem resto,
@@ -69,7 +120,7 @@ positividade, `value_limit`, fontes definidas, índices, cobertura acumulada dos
 4.096 instruções e 131.072 bytes UTF-8 por célula. A leitura exige exatamente as colunas `id,program`,
 IDs únicos e um programa JSON válido. Ao pontuar, exige os mesmos IDs do arquivo de puzzles fornecido.
 
-Os 28 testes passam. Eles cobrem o exemplo oficial de quatro instruções, operações inválidas, inteiros até `10^18`, leitura
+Os 77 testes passam, incluindo integração compilada em C++ e o laboratório. Eles cobrem o exemplo oficial de quatro instruções, operações inválidas, inteiros até `10^18`, leitura
 antes de sobrescrita, cobertura depois de reciclar um alvo, serialização CSV/JSON, limites e puzzles aleatórios.
 O sample oficial passou nos 1.000 puzzles, com **1.490.379 instruções**. Uma comparação independente de
 10.000 programas aleatórios encontrou zero divergências entre o verificador e um segundo interpretador.

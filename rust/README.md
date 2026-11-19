@@ -8,7 +8,7 @@ It emits and flushes one result per puzzle. Other solver modes are unsupported.
 Build from the repository root:
 
 ```sh
-rustc -O -C target-cpu=native rust/repair.rs -o outputs/bin/repair-rust
+rustc --edition=2021 -O -C target-cpu=native rust/repair.rs -o outputs/bin/repair-rust
 ```
 
 The positional arguments are `width alpha n_done n_recent index_bits 6 seed
@@ -19,7 +19,7 @@ instruction counts and validity must match before comparing speed.
 Run the Rust boundary checks with:
 
 ```sh
-rustc --test -O rust/repair.rs -o outputs/bin/repair-rust-tests
+rustc --edition=2021 --test -O rust/repair.rs -o outputs/bin/repair-rust-tests
 outputs/bin/repair-rust-tests
 ```
 
@@ -37,7 +37,7 @@ plus alternative derivations. The rank is the compiled prefix cost plus 0.4
 times the sum of the additional compiled costs of each remaining target.
 Only shorter complete programs that pass strict replay can replace the input.
 
-Build it with `rustc -O -C target-cpu=native rust/optimizer.rs -o
+Build it with `rustc --edition=2021 -O -C target-cpu=native rust/optimizer.rs -o
 outputs/bin/optimizer-rust`. It uses the same arguments and mode-6 hint protocol.
 `trials` controls tail neighborhoods and `passes` controls repeated passes.
 Search also stops after at most `512 * max(1, trials) * passes` beam searches
@@ -66,3 +66,40 @@ fresh search result. Retained values remain available; removed helpers pay
 their actual construction cost. Duplicate graph/schedule candidates are
 removed before the shortlist. The default, unset or `0`, keeps V1 selection
 and search choices. Other flag values are rejected.
+
+## Puzzle-only constructor
+
+`construct.rs` generates a complete program directly from starting values and
+targets. It never reads a hint or an existing submission. Its live 48-register
+bank pays every bootstrap, temporary and target operation. Exact one/two-step
+tables and inverse joins find plans through four operations; otherwise it
+constructs a nearby product or sum and recursively resolves the residual,
+ranking candidates by the bits removed per instruction. Short target choices
+use one-step lookahead against the resulting resident bank. Register eviction
+preserves scale diversity and anchors near remaining targets, and a backward
+pass removes instructions not needed for target coverage.
+
+Build: `rustc --edition=2021 -O -C target-cpu=native rust/construct.rs -o
+outputs/bin/construct-rust`. Arguments are `seed effort milliseconds`, default
+`0 1 2000`; effort is 1–8. Input is `id limit ns nt starts... targets...` with
+no hint. Output is the same one-line JSON program protocol, flushed per puzzle.
+The time limit is a soft planning budget: after it expires the constructor
+finishes missing targets with binary arithmetic before emitting a complete
+program. Set `SANTA2026_CONSTRUCT_TRACE=1` for per-puzzle timing on stderr.
+Tests: `rustc --edition=2021 --test -O rust/construct.rs -o outputs/bin/construct-rust-tests`.
+
+The construction strategy is inspired by Pablo Diego's Apache-2.0
+[Deterministic Atlas Solver](https://www.kaggle.com/code/pablodiegoo/santa-2026-deterministic-atlas-solver?scriptVersionId=371078087).
+The implementation reuses the attributed integer index from `repair.rs` and
+implements its own physical-bank execution. Its standalone score and any
+recipe-pool benefit must be measured separately against the validated best
+submission; a diverse construction is not automatically a score improvement.
+
+Constructor seeds use all 64 bits for leaf insertion, interleaved P2 phases,
+target and recipe ties, and an optional odd helper. Seed zero keeps the original
+ordering and palette profile. Seeds are no longer limited to twelve repeated
+profiles. Approximate joins also retain exact zero-residual results, count
+shared temporary values at their real emitted cost, and examine the product
+neighbor above an exact floor quotient. A value reached by several plans keeps
+the cheapest actual plan. In particular a shared P2+P2 diamond can cost four
+operations rather than its five-operation tree expansion.

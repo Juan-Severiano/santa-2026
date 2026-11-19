@@ -44,6 +44,14 @@ class RustQualityTests(unittest.TestCase):
         self.assertEqual(record["program"], shorter)
         self.assertTrue(record["attempts"][0]["recovered_complete_output"])
 
+    def test_constructor_keeps_longer_diverse_candidate_without_regressing_best(self):
+        longer = self.original + [["+", 1, 1, 5]]
+        valid = subprocess.CompletedProcess([], 0, "puzzle " + json.dumps(longer) + "\n", "")
+        with patch.object(quality.subprocess, "run", side_effect=[valid, subprocess.TimeoutExpired("engine", 1)]):
+            record = quality.search("construct", Path("engine"), self.puzzle, self.original, [], 1)
+        self.assertEqual(record["program"], self.original)
+        self.assertEqual(record["generated_programs"], [longer])
+
     def test_joint_payload_counts_programs_before_instructions(self):
         data = quality.payload(self.puzzle, [self.original, self.original], joint=True).split()
         self.assertEqual(data[:8], ["puzzle", "10", "1", "1", "3", "5", "2", "4"])

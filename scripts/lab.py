@@ -18,7 +18,7 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 WORKER_CANDIDATES = []
-DEFAULT_NATIVE_OPTIONS = {"optimizer_ms": None, "optimizer_boundary": 0, "joint_helpers": 0}
+DEFAULT_NATIVE_OPTIONS = {"optimizer_ms": None, "optimizer_boundary": 0, "joint_helpers": 0, "groups_direct": 0, "joint_plans": 0, "joint_ms": None}
 sys.path.insert(0, str(REPOSITORY / "src"))
 
 from santa2026.core import (  # noqa: E402
@@ -54,7 +54,8 @@ def _load_frozen(output, requested):
         if key in configuration and configuration[key] != requested.get(key):
             raise ValueError(f"frozen experiment requires its original {key}")
     if "native_options" in requested:
-        if configuration.get("native_options", DEFAULT_NATIVE_OPTIONS) != requested["native_options"]:
+        saved_native = dict(DEFAULT_NATIVE_OPTIONS, **configuration.get("native_options", {}))
+        if saved_native != dict(DEFAULT_NATIVE_OPTIONS, **requested["native_options"]):
             raise ValueError("frozen experiment requires its original native_options")
         if "rustjoint" in configuration["strategies"] and "native_options" not in configuration:
             raise ValueError("frozen joint experiment is missing signed native_options")
@@ -119,6 +120,12 @@ def _initialize(snapshot, beam_binary=None, beam_mode=0, repair_mode=6, repair_t
     os.environ.pop("SANTA2026_GROUPS_MS", None)
     os.environ["SANTA2026_OPTIMIZER_BOUNDARY"] = str(native_options["optimizer_boundary"])
     os.environ["SANTA2026_JOINT_HELPERS"] = str(native_options["joint_helpers"])
+    os.environ["SANTA2026_GROUPS_DIRECT"] = str(native_options.get("groups_direct", 0))
+    os.environ["SANTA2026_JOINT_PLANS"] = str(native_options.get("joint_plans", 0))
+    if native_options.get("joint_ms") is None:
+        os.environ.pop("SANTA2026_JOINT_MS", None)
+    else:
+        os.environ["SANTA2026_JOINT_MS"] = str(native_options["joint_ms"])
     if native_options["optimizer_ms"] is None:
         os.environ.pop("SANTA2026_OPTIMIZER_MS", None)
     else:
@@ -194,8 +201,11 @@ def main(argv=None):
     parser.add_argument("--mitm-binary", type=Path)
     parser.add_argument("--joint-binary", type=Path, help="Override the Rust joint-recipe optimizer")
     parser.add_argument("--joint-helpers", type=int, help="0..24; defaults to SANTA2026_JOINT_HELPERS or 0")
+    parser.add_argument("--joint-plans", type=int, help="0..256; defaults to SANTA2026_JOINT_PLANS or 0")
+    parser.add_argument("--joint-ms", type=int, help="Rust joint search budget; defaults to SANTA2026_JOINT_MS")
     parser.add_argument("--optimizer-ms", type=int, help="Native structural-search deadline; defaults to SANTA2026_OPTIMIZER_MS")
     parser.add_argument("--optimizer-boundary", type=int, choices=(0, 1), help="Prioritize exact retained cut boundary")
+    parser.add_argument("--groups-direct", type=int, choices=(0, 1), help="Direct single-target private-cone resynthesis")
     parser.add_argument("--beam-mode", type=int, choices=(0, 1, 2, 3, 4), default=0)
     parser.add_argument("--repair-mode", type=int, choices=(6, 7, 8, 9), default=6)
     parser.add_argument("--repair-trials", type=int, default=12)
@@ -205,15 +215,23 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         args.joint_helpers = args.joint_helpers if args.joint_helpers is not None else int(os.environ.get("SANTA2026_JOINT_HELPERS", "0"))
+        args.joint_plans = args.joint_plans if args.joint_plans is not None else int(os.environ.get("SANTA2026_JOINT_PLANS", "0"))
         args.optimizer_boundary = args.optimizer_boundary if args.optimizer_boundary is not None else int(os.environ.get("SANTA2026_OPTIMIZER_BOUNDARY", "0"))
+        args.groups_direct = args.groups_direct if args.groups_direct is not None else int(os.environ.get("SANTA2026_GROUPS_DIRECT", "0"))
         if args.optimizer_ms is None and os.environ.get("SANTA2026_OPTIMIZER_MS") is not None:
             args.optimizer_ms = int(os.environ["SANTA2026_OPTIMIZER_MS"])
+        if args.joint_ms is None and os.environ.get("SANTA2026_JOINT_MS") is not None:
+            args.joint_ms = int(os.environ["SANTA2026_JOINT_MS"])
     except ValueError:
         parser.error("native options must be integers")
-    if not 0 <= args.joint_helpers <= 24 or args.optimizer_boundary not in (0, 1):
-        parser.error("joint-helpers must be 0..24 and optimizer-boundary must be 0 or 1")
+    if not 0 <= args.joint_helpers <= 24 or args.optimizer_boundary not in (0, 1) or args.groups_direct not in (0, 1):
+        parser.error("joint-helpers must be 0..24 and boundary/direct flags must be 0 or 1")
+    if not 0 <= args.joint_plans <= 256:
+        parser.error("joint-plans must be 0..256")
     if args.optimizer_ms is not None and not 1 <= args.optimizer_ms <= 600000:
         parser.error("optimizer-ms must be 1..600000")
+    if args.joint_ms is not None and not 1 <= args.joint_ms <= 120000:
+        parser.error("joint-ms must be 1..120000")
     if args.jobs is None:
         # The native repair dictionary can have a much larger RSS than the
         # Python constructions. Let explicit --jobs opt into parallel repair.
@@ -248,7 +266,10 @@ def main(argv=None):
     configuration["dependency_versions"] = {}
     if "polish" in args.strategies or "rustjoint" in args.strategies:
         configuration["native_options"] = {"optimizer_ms": args.optimizer_ms,
-            "optimizer_boundary": args.optimizer_boundary, "joint_helpers": args.joint_helpers}
+            "optimizer_boundary": args.optimizer_boundary, "joint_helpers": args.joint_helpers,
+            "groups_direct": args.groups_direct}
+        configuration["native_options"]["joint_plans"] = args.joint_plans
+        configuration["native_options"]["joint_ms"] = args.joint_ms
     for dependency in ("numpy", "scipy", "ortools"):
         try:
             configuration["dependency_versions"][dependency] = importlib.metadata.version(dependency)

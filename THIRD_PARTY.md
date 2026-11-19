@@ -37,3 +37,18 @@ The pinned notebook, original upstream attributions, source bundle, license evid
 are preserved locally under `data/public/research/reference-atakan-v2/`. This is an inherited public
 reference, not an improvement produced by the Rust experiments. The Rust joint-recipe search uses
 coordinated graph mutations, whereas the notebook's published joint selection uses CP-SAT.
+
+The newer [Atakan notebook version 8](https://www.kaggle.com/code/atakanaldemir/santa-2026-joint-recipes-for-large-puzzles?scriptVersionId=371150866)
+was separately pinned and its owning page again verified as Apache 2.0. Its 1,000 programs replay
+with 141,394 instructions and SHA-256
+`435d97be3423ba2369926f1bfd38bd2b0d958f605a24816a718cf130764887d5`.
+The separate snapshot and evidence are under `data/public/research/reference-atakan-v8/`.
+This is also a public-reference result, not a gain attributed to this repository's Rust searches.
+
+The fresh constructor in `rust/construct.rs` is independently implemented in Rust using resident-bank
+joins, residual planning and scale/anchor retention inspired by **Pablo Diego's**
+[Deterministic Atlas Solver, version 1](https://www.kaggle.com/code/pablodiegoo/santa-2026-deterministic-atlas-solver?scriptVersionId=371078087).
+Its owning page identifies the code as Apache 2.0, verified on 2026-11-18; pinned source, original
+credits and license evidence remain in `data/public/research/atlas-solver/`. Downloaded foreign code
+was inspected but not executed. The constructor retains the Tony Li/konbu17 attribution for reused
+dictionary and expression primitives.

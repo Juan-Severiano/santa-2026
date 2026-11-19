@@ -40,13 +40,18 @@ def optimize_rust_joint(puzzle: Puzzle, programs, seed=0, effort=1):
         fields.append(len(program))
         for instruction in program:
             fields.extend(instruction)
-    budget = min(12_000, 2000 * effort)
+    budget = int(os.environ.get("SANTA2026_JOINT_MS", str(min(12_000, 2000 * effort))))
+    if not 1 <= budget <= 120_000:
+        raise ValueError("joint time budget must be between one and 120000 milliseconds")
     helpers = int(os.environ.get("SANTA2026_JOINT_HELPERS", "0"))
     if not 0 <= helpers <= 24:
         raise ValueError("joint helper budget must be between zero and 24")
+    plans = int(os.environ.get("SANTA2026_JOINT_PLANS", "0"))
+    if not 0 <= plans <= 256:
+        raise ValueError("joint plan budget must be between zero and 256")
     try:
         completed = subprocess.run(
-            [str(binary_path()), str(seed % 2**64), str(min(40_000, 1600 * effort)), "8", "1024", str(budget), str(helpers)],
+            [str(binary_path()), str(seed % 2**64), str(min(40_000, 1600 * effort)), "8", "1024", str(budget), str(helpers), str(plans)],
             input=" ".join(map(str, fields)) + "\n", text=True, capture_output=True, check=True,
             timeout=30 + budget / 1000,
         )

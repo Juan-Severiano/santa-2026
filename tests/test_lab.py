@@ -64,9 +64,12 @@ class LabTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             expected, _ = self.frozen_fixture(root)
-            options = dict(lab.DEFAULT_NATIVE_OPTIONS, joint_helpers=24)
-            with self.assertRaisesRegex(ValueError, "native_options"):
-                lab._load_frozen(root, dict(expected, native_options=options))
+            for changed in ({"joint_helpers": 24}, {"joint_plans": 4},
+                            {"joint_ms": 4000}, {"groups_direct": 1}):
+                with self.subTest(changed=changed):
+                    options = dict(lab.DEFAULT_NATIVE_OPTIONS, **changed)
+                    with self.assertRaisesRegex(ValueError, "native_options"):
+                        lab._load_frozen(root, dict(expected, native_options=options))
 
     def test_sample_spans_cost_distribution_without_duplicates(self):
         puzzles = [Puzzle(str(i), (1,), (1,), 1) for i in range(1000)]

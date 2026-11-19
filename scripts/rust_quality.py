@@ -42,22 +42,34 @@ def payload(puzzle, programs, joint=False):
     return " ".join(map(str, fields)) + "\n"
 
 
-def search(name, binary, puzzle, original, candidates, seconds, joint_helpers=0, tail_boundary=False):
+def search(name, binary, puzzle, original, candidates, seconds, joint_helpers=0, tail_boundary=False, groups_direct=False, joint_plans=0, window_rename=False):
     best = [instruction[:] for instruction in original]
+    generated = []
     lower_bound = len(set(puzzle.targets) - set(puzzle.starting_values))
     attempts = []
     started = time.perf_counter()
     deadline = started + seconds
     for index in range(64):
         remaining = deadline - time.perf_counter()
-        if remaining < .03 or len(best) == lower_bound:
+        if remaining < .03 or (name != "construct" and len(best) == lower_bound):
             break
         environment = os.environ.copy()
-        if name == "joint":
+        if name in ("window", "construct"):
+            milliseconds = max(1, int(min(2, remaining - .02) * 1000))
+            if name == "window":
+                command = [str(binary), str(index), "24", "32", "96", str(milliseconds)]
+                command.append("1" if window_rename else "0")
+                data = payload(puzzle, [best])
+            else:
+                command = [str(binary), str(index), "1", str(milliseconds)]
+                data = payload(puzzle, [])
+        elif name == "joint":
             milliseconds = max(1, int(min(2, remaining - .02) * 1000))
             command = [str(binary), str(index), "4000", "8", "1024", str(milliseconds)]
-            if joint_helpers:
+            if joint_helpers or joint_plans:
                 command.append(str(joint_helpers))
+            if joint_plans:
+                command.append(str(joint_plans))
             data = payload(puzzle, [best, *candidates], joint=True)
         else:
             if name == "repair":
@@ -70,6 +82,7 @@ def search(name, binary, puzzle, original, candidates, seconds, joint_helpers=0,
                 environment["SANTA2026_OPTIMIZER_BOUNDARY"] = "1" if tail_boundary else "0"
                 if name == "groups":
                     environment["SANTA2026_GROUPS_MS"] = environment["SANTA2026_OPTIMIZER_MS"]
+                    environment["SANTA2026_GROUPS_DIRECT"] = "1" if groups_direct else "0"
             command = [str(binary), str(width), str(alpha), str(done), str(recent), str(bits),
                        "6", str(seed), str(trials), str(passes)]
             data = payload(puzzle, [best])
@@ -102,6 +115,10 @@ def search(name, binary, puzzle, original, candidates, seconds, joint_helpers=0,
             record["error"] = str(exc)
         if program is not None:
             record["instructions"] = len(program)
+            if name == "construct" and program not in generated:
+                generated.append(program)
+                generated.sort(key=len)
+                generated = generated[:3]
             if len(program) < len(best):
                 best = program
         after = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -115,7 +132,7 @@ def search(name, binary, puzzle, original, candidates, seconds, joint_helpers=0,
             "instructions": len(best), "program": best, "attempts": attempts,
             "wall_seconds": time.perf_counter() - started,
             "cpu_seconds": sum(a["cpu_seconds"] for a in attempts),
-            "seconds_budget": seconds}
+            "seconds_budget": seconds, "generated_programs": generated}
 
 
 def main():
@@ -128,15 +145,20 @@ def main():
     parser.add_argument("--tail", type=Path, default=Path("outputs/bin/optimizer-rust"))
     parser.add_argument("--joint", type=Path, default=Path("outputs/bin/joint-rust"))
     parser.add_argument("--groups", type=Path, default=Path("outputs/bin/factor-groups-rust"))
+    parser.add_argument("--window", type=Path, default=Path("outputs/bin/window-rust"))
+    parser.add_argument("--construct", type=Path, default=Path("outputs/bin/construct-rust"))
     parser.add_argument("--seconds", type=float, default=4)
-    parser.add_argument("--methods", choices=("repair", "tail", "joint", "groups"), nargs="+", default=["repair", "tail", "joint"])
+    parser.add_argument("--methods", choices=("repair", "tail", "joint", "groups", "window", "construct"), nargs="+", default=["repair", "tail", "joint"])
     parser.add_argument("--joint-helpers", type=int, default=0)
+    parser.add_argument("--joint-plans", type=int, default=0)
     parser.add_argument("--tail-boundary", action="store_true")
+    parser.add_argument("--groups-direct", action="store_true", help="Resynthesize one complete private cone from safe outside context")
+    parser.add_argument("--window-rename", action="store_true", help="Match physical live-outs up to a bijective suffix register renaming")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.seconds <= 0:
         parser.error("seconds must be positive")
-    if len(set(args.methods)) != len(args.methods) or args.joint_helpers < 0:
+    if len(set(args.methods)) != len(args.methods) or args.joint_helpers < 0 or not 0 <= args.joint_plans <= 256:
         parser.error("methods must be unique and helper budget nonnegative")
     puzzles = read_puzzles(args.puzzles)
     by_id = {p.id: p for p in puzzles}
@@ -156,8 +178,11 @@ def main():
                      "candidate_sha256": [digest(path) for path in args.candidates], "ids": ids,
                      "seconds_per_puzzle_engine": args.seconds,
                      "methods": args.methods, "joint_helpers": args.joint_helpers, "tail_boundary": args.tail_boundary,
+                     "groups_direct": args.groups_direct,
+                     "joint_plans": args.joint_plans,
+                     "window_rename": args.window_rename,
                      "trace_environment": {name: os.environ.get(name) == "1" for name in
-                         ("SANTA2026_JOINT_TRACE", "SANTA2026_OPTIMIZER_TRACE", "SANTA2026_GROUPS_TRACE")},
+                         ("SANTA2026_JOINT_TRACE", "SANTA2026_OPTIMIZER_TRACE", "SANTA2026_GROUPS_TRACE", "SANTA2026_WINDOW_TRACE")},
                      "binaries": {name: digest(path) for name, path in engines.items()},
                      "script_sha256": digest(Path(__file__)),
                      "core_sha256": digest(ROOT / "src/santa2026/core.py"),
@@ -188,7 +213,8 @@ def main():
             if record is None or record.get("signature") != signature:
                 record = search(name, engines[name], by_id[identifier], baseline[identifier],
                                 [programs[identifier] for programs in candidates], args.seconds,
-                                args.joint_helpers, args.tail_boundary)
+                                args.joint_helpers, args.tail_boundary, args.groups_direct, args.joint_plans,
+                                args.window_rename)
                 record["signature"] = signature
                 atomic_json(path, record)
             if record["id"] != identifier or record["engine"] != name:
@@ -216,6 +242,23 @@ def main():
                            "cpu_seconds": sum(r["cpu_seconds"] for r in rows),
                            "errors": [dict(id=r["id"], **a) for r in rows for a in r["attempts"] if "error" in a],
                            "budget_exhaustions": sum(bool(a.get("budget_exhausted")) for r in rows for a in r["attempts"])}
+        if name == "construct":
+            raw_rows = [row for row in rows if row.get("generated_programs")]
+            summaries[name]["generated_cases"] = len(raw_rows)
+            summaries[name]["standalone_selected_instructions"] = sum(len(r["generated_programs"][0]) for r in raw_rows)
+            summaries[name]["baseline_for_generated_cases"] = sum(r["baseline_instructions"] for r in raw_rows)
+            summaries[name]["raw_portfolios"] = []
+            for variant in range(3):
+                raw = dict(baseline)
+                for row in raw_rows:
+                    choices = row["generated_programs"]
+                    raw[row["id"]] = choices[min(variant, len(choices) - 1)]
+                raw_output = args.output / f"construct-generated-{variant}.csv"
+                write_submission(raw_output, raw)
+                raw_scores = score_submission(puzzles, read_submission(raw_output))
+                summaries[name]["raw_portfolios"].append({"path": str(raw_output),
+                    "score": sum(item.instructions for item in raw_scores.values()),
+                    "sha256": digest(raw_output)})
     write_submission(args.output / "best.csv", combined)
     combined_score = sum(r.instructions for r in score_submission(puzzles, read_submission(args.output / "best.csv")).values())
     atomic_json(args.output / "report.json", {"signature": signature, "selected": len(ids),

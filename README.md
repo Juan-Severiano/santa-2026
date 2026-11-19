@@ -28,14 +28,19 @@ Separar as rodadas permite reaproveitar o baseline e executar apenas a variaçã
 
 ## Resultados e checkpoints em 18/11/2026
 
-**Checkpoint atual no Kaggle: 144.213 instruções**, submissão **58519516**, aceita e pontuada.
-O portfólio parte da referência pública Apache-2.0 de Hanif versão 4 (**144.248**) e incorpora
+**Checkpoint atual no Kaggle: 142.272 instruções**, submissão **58523172**, aceita e pontuada.
+O resultado usa a referência pública Apache-2.0 de Atakan Aldemir versão 2; nenhum ganho próprio
+adicional foi demonstrado nesta base. O CSV enviado está arquivado em `outputs/checkpoint-142272.csv`, SHA-256
+`66f6842840e7b348d7ca01c06817efd9942cda76b5aa0dc879e1db59c3b7498c`.
+Os 1.000 programas passaram no replay e a pontuação oficial coincidiu com a previsão local.
+
+O checkpoint **144.213**, submissão **58519516**, parte da referência pública Apache-2.0 de Hanif versão 4 (**144.248**) e incorpora
 **35 instruções de economia** de experimentos locais, incluindo o reparo em Rust.
 O CSV enviado é `outputs/rust-main-submission.csv`, SHA-256
 `39df138984fd17e02770d15a6a545bebdc84ee1a136951996f7dc2c9ff9c93a8`.
 Os 1.000 programas passaram no replay e a pontuação oficial coincidiu com a previsão local.
 
-O checkpoint anterior, **159.737**, submissão **58512481**, parte dos **160.175** programas públicos de konbu17 e acrescenta **438 instruções de
+O checkpoint de **159.737**, submissão **58512481**, parte dos **160.175** programas públicos de konbu17 e acrescenta **438 instruções de
 economia** por MILP, replanejamento C++ e compressão próprios. A origem Apache-2.0 está documentada
 em [THIRD_PARTY.md](THIRD_PARTY.md). A construção exclusivamente própria chegou a 233.968.
 
@@ -145,7 +150,7 @@ atribuir o resultado apenas à velocidade das implementações.
 
 O baseline congelado desta comparação tem **144.238 instruções**, partindo da referência pública
 Hanif versão 4 (**144.248**) e incorporando melhorias locais. Os 1.000 programas passaram no replay;
-esse arquivo é a entrada fixa dos testes, anterior ao checkpoint oficial de 144.213 no Kaggle.
+esse arquivo é a entrada fixa dos testes, anterior ao checkpoint oficial de 142.272 no Kaggle.
 Os relatórios preservam o melhor programa válido por puzzle e mantêm os demais do baseline.
 
 Em 18/11/2026, três repetições de 100 puzzles com o mesmo modo 6, largura 3, 12 tentativas,
@@ -186,7 +191,7 @@ retomada, separadamente do motor de construção.
 
 A nova referência de pesquisa é o portfólio público Apache-2.0 de
 [Atakan Aldemir, versão 2](https://www.kaggle.com/code/atakanaldemir/santa-2026-joint-recipes-for-large-puzzles?scriptVersionId=371115522),
-validado separadamente com **142.272 instruções**. Esse avanço sobre o checkpoint oficial de 144.213
+validado separadamente com **142.272 instruções**, posteriormente confirmado na submissão **58523172**. Esse avanço sobre o checkpoint anterior de 144.213
 vem da referência pública; a contribuição de cada experimento é medida além dela. Proveniência,
 licença, notebook fixado e replay ficam em `data/public/research/reference-atakan-v2/`.
 
@@ -229,6 +234,44 @@ Todos esses lotes mantiveram programas válidos e a nota de 142.272. Ganhos nos 
 testes demonstram o comportamento das novas buscas, mas não são apresentados como ganho na competição.
 Os experimentos não sustentam uma projeção abaixo de 100.000.
 
+## Construções novas e janelas de várias saídas
+
+`rust/construct.rs` recebe apenas sementes, alvos e limite do puzzle, sem programa de referência.
+Trabalha em um banco real de 48 registradores, com joins exatos, aproximações e construção de resíduos.
+O método é inspirado no Atlas Solver Apache-2.0 e tem atribuição em [THIRD_PARTY.md](THIRD_PARTY.md).
+Programas válidos mais longos também são preservados como variantes para ampliar o pool de receitas;
+eles não substituem um programa menor no portfólio principal.
+
+`rust/window.rs` busca substituições de janelas de 3–8 instruções, preservando as leituras futuras e os
+alvos vistos dentro da janela, inclusive quando depois são sobrescritos. A opção `--window-rename`
+permite encontrar as saídas em outros registradores e aplicar uma permutação bijetiva ao sufixo.
+Valores iguais em posições distintas continuam precisando de cópias físicas distintas.
+
+O modo `--groups-direct` reconstrói um alvo a partir do contexto externo ao seu cone privado completo.
+No joint, `--joint-plans` monta rotas inteiras do pool usando custos positivos de hipergrafo e um
+prefixo fixado. A estimativa de árvore guia a busca; a aceitação usa o programa compilado e reexecutado.
+Cada estado conserva sua ordem de alvos; cache, macros e mutações distinguem e herdam essa ordem.
+O laboratório assina também `--groups-direct`, `--joint-plans` e `--joint-ms` para impedir retomadas
+com opções incompatíveis.
+
+```sh
+python3 scripts/build_native.py --engine rust --source rust/construct.rs --output outputs/bin/construct-rust
+python3 scripts/build_native.py --engine rust --source rust/window.rs --output outputs/bin/window-rust
+```
+
+Nos 20 puzzles representativos com limite de 4 s por método, a reconstrução direta e as janelas,
+inclusive com renomeação, não melhoraram a referência. O construtor V1 gerou 4.295 instruções no recorte,
+contra 2.837 da base; suas variantes continham 12.126 receitas vivas diferentes da base. Duas correções
+de joins e o uso dos 64 bits da seed reduziram o construtor V2 para 4.197 instruções nos mesmos casos.
+Essa economia de 98 é medida no construtor, não é ganho sobre a referência da competição.
+Os testes de combinação com essas variantes e de planejamento por hipergrafo, incluindo a correção
+da ordem preservada nos estados, também terminaram sem ganho nos mesmos 20 puzzles. Todos os programas
+aceitos passaram no replay; resultados e candidatos ficam separados em `outputs/rust-new-pilot/`.
+
+Uma versão pública posterior de Atakan, fixada em `scriptVersionId=371150866`, foi validada com
+**141.394 instruções**. Ela fica separada dos pilotos congelados em 142.272 e ainda não foi submetida
+por esta conta. Sua origem pública está documentada; ganhos dos nossos experimentos são medidos à parte.
+
 ## Validação
 
 O verificador usa inteiros do Python, sem ponto flutuante. Confere as quatro operações, divisão sem resto,
@@ -236,7 +279,7 @@ positividade, `value_limit`, fontes definidas, índices, cobertura acumulada dos
 4.096 instruções e 131.072 bytes UTF-8 por célula. A leitura exige exatamente as colunas `id,program`,
 IDs únicos e um programa JSON válido. Ao pontuar, exige os mesmos IDs do arquivo de puzzles fornecido.
 
-Os 148 testes passam, incluindo integração compilada, paridade C++/Rust/Go e o laboratório. As três suítes Rust dos novos motores também passam. Eles cobrem o exemplo oficial de quatro instruções, operações inválidas, inteiros até `10^18`, leitura
+Os 162 testes passam, incluindo integração compilada, paridade C++/Rust/Go e o laboratório. As suítes Rust dos novos motores também passam. Eles cobrem o exemplo oficial de quatro instruções, operações inválidas, inteiros até `10^18`, leitura
 antes de sobrescrita, cobertura depois de reciclar um alvo, serialização CSV/JSON, limites e puzzles aleatórios.
 O sample oficial passou nos 1.000 puzzles, com **1.490.379 instruções**. Uma comparação independente de
 10.000 programas aleatórios encontrou zero divergências entre o verificador e um segundo interpretador.

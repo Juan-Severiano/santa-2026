@@ -34,10 +34,11 @@ class RustJointTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def optimize(self, puzzle, programs, seed=0, helpers=0):
+    def optimize(self, puzzle, programs, seed=0, helpers=0, plans=0):
         before = copy.deepcopy(programs)
         with patch.dict("os.environ", {"SANTA2026_JOINT_BINARY": str(self.binary),
-                                       "SANTA2026_JOINT_HELPERS": str(helpers)}):
+                                       "SANTA2026_JOINT_HELPERS": str(helpers),
+                                       "SANTA2026_JOINT_PLANS": str(plans)}):
             result = optimize_rust_joint(puzzle, programs, seed=seed)
         self.assertEqual(programs, before)
         validate_program(puzzle, result)
@@ -73,7 +74,7 @@ class RustJointTests(unittest.TestCase):
         self.assertEqual(len(self.optimize(puzzle, [hint], helpers=0)), 5)
         self.assertEqual(len(self.optimize(puzzle, [hint], helpers=24)), 3)
 
-    def run_native(self, puzzle, programs, evaluations, milliseconds, helpers):
+    def run_native(self, puzzle, programs, evaluations, milliseconds, helpers, plans=0):
         fields = ["puzzle", puzzle.value_limit, len(puzzle.starting_values), len(puzzle.targets),
                   *puzzle.starting_values, *puzzle.targets, len(programs)]
         for program in programs:
@@ -81,7 +82,7 @@ class RustJointTests(unittest.TestCase):
             for instruction in program:
                 fields.extend(instruction)
         response = subprocess.run(
-            [str(self.binary), "0", str(evaluations), "8", "4096", str(milliseconds), str(helpers)],
+            [str(self.binary), "0", str(evaluations), "8", "4096", str(milliseconds), str(helpers), str(plans)],
             input=" ".join(map(str, fields)) + "\n", text=True, capture_output=True, check=True,
             timeout=10, env={**os.environ, "SANTA2026_JOINT_TRACE": "1"},
         )
@@ -100,6 +101,32 @@ class RustJointTests(unittest.TestCase):
         self.assertIn("macroeval=1", trace)
         self.assertIn("mutations=0", trace)
         self.assertIn("improvements=1", trace)
+
+    def test_pool_planner_rebuilds_a_route_with_more_than_three_recipe_changes(self):
+        # The short path switches16,256,65536,2**32 from doubling to
+        # squaring. Both source programs first construct the old31-op path;
+        # the longer source only exposes the five-op route as later dead work.
+        # With zero gene evaluations only complete-route planning can use it.
+        puzzle = Puzzle("whole-route", (2,), (2**32,), 10**18)
+        baseline = [["+", 0, 0, 1]] + [["+", 1, 1, 1] for _ in range(30)]
+        longer = baseline + [["*", 0, 0, 2], ["*", 2, 2, 3], ["*", 3, 3, 4],
+                             ["*", 4, 4, 5], ["*", 5, 5, 6]]
+        old, _ = self.run_native(puzzle, [baseline, longer], 0, 2000, 0, plans=0)
+        result, trace = self.run_native(puzzle, [baseline, longer], 0, 2000, 0, plans=4)
+        self.assertEqual(len(old), 31)
+        self.assertEqual(len(result), 5)
+        self.assertIn("plans=4", trace)
+        self.assertIn("mutations=0", trace)
+
+    def test_planner_duplicate_operands_cost_once_and_prefix_is_pinned(self):
+        result = subprocess.run([str(self.unit_binary), "engine::planner_tests"], check=True,
+                                text=True, capture_output=True, timeout=10)
+        self.assertIn("1 passed", result.stdout)
+
+    def test_target_schedules_remain_distinct_and_descendants_inherit_them(self):
+        result = subprocess.run([str(self.unit_binary), "engine::joint_schedule_tests"], check=True,
+                                text=True, capture_output=True, timeout=10)
+        self.assertIn("2 passed", result.stdout)
 
     def test_expired_deadline_replays_fallback_and_rejects_invalid_hint(self):
         # An injected expired Instant gives deterministic coverage of the

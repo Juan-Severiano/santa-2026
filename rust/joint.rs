@@ -3,7 +3,7 @@
 // Reuses the Apache-2.0 Tony Li / konbu17 Rust graph and 48-register allocator.
 // See repair.rs, THIRD_PARTY.md and licenses/Apache-2.0.txt.
 // Protocol: id limit ns nt, starts, targets, n_programs, then count/op i j d per program.
-// Arguments: seed=0 evaluations=1600 beam=8 exact_values=1024 milliseconds=2000 helpers=0.
+// Arguments: seed=0 evaluations=1600 beam=8 exact_values=1024 milliseconds=2000 helpers=0 plans=0.
 
 #[allow(dead_code)]
 mod engine {
@@ -11,6 +11,8 @@ mod engine {
 
     use std::time::{Duration, Instant};
     use std::collections::HashSet;
+    use std::collections::BinaryHeap;
+    use std::cmp::Reverse;
 
     #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
     struct Recipe { op: u8, a: usize, b: usize }
@@ -18,10 +20,13 @@ mod engine {
     #[derive(Clone)]
     struct JointState {
         choices: Vec<u16>,
+        target_order: Vec<Int>,
         cost: usize,
         active: Vec<usize>,
         hash: u64,
     }
+
+    type Seen = BTreeSet<(u64, Vec<Int>)>;
 
     struct JointGraph {
         values: Vec<Int>,
@@ -34,20 +39,20 @@ mod engine {
 
     struct JointHelper { node: usize, consumers: Vec<(usize, Vec<u16>)> }
 
-    struct JointTrace { enabled: bool, helpers: usize, macros: usize, mutations: usize, improvements: usize }
+    struct JointTrace { enabled: bool, helpers: usize, macros: usize, mutations: usize, improvements: usize, plans: usize }
 
     impl JointTrace {
         fn new() -> Self {
             Self { enabled: env::var("SANTA2026_JOINT_TRACE").map_or(false, |value| value != "0"),
-                helpers: 0, macros: 0, mutations: 0, improvements: 0 }
+                helpers: 0, macros: 0, mutations: 0, improvements: 0, plans: 0 }
         }
     }
 
     impl Drop for JointTrace {
         fn drop(&mut self) {
             if self.enabled {
-                eprintln!("joint_trace helpers={} macroeval={} mutations={} improvements={}",
-                          self.helpers, self.macros, self.mutations, self.improvements);
+                eprintln!("joint_trace helpers={} macroeval={} mutations={} improvements={} plans={}",
+                          self.helpers, self.macros, self.mutations, self.improvements, self.plans);
             }
         }
     }
@@ -315,16 +320,17 @@ mod engine {
         Some(ordered)
     }
 
-    fn evaluate(puzzle: &Puzzle, graph: &JointGraph, choices: Vec<u16>, best: &mut Program,
-                seen: &mut BTreeSet<u64>, deadline: Instant) -> Option<JointState> {
+    fn evaluate(puzzle: &Puzzle, graph: &JointGraph, choices: Vec<u16>, target_order: &[Int],
+                best: &mut Program, seen: &mut Seen, deadline: Instant) -> Option<JointState> {
         if Instant::now() >= deadline { return None; }
         let hash = graph_hash(&choices);
-        if !seen.insert(hash) { return None; }
+        if !seen.insert((hash, target_order.to_vec())) { return None; }
         let active = topology(graph, &choices, deadline)?;
         // A count of distinct nodes is only a lower bound. Keep a small uphill
         // allowance for coordinated moves, then score the actual executable.
         if active.len() > best.len() + 12 { return None; }
         let mut candidate = puzzle.clone();
+        candidate.targets = target_order.to_vec();
         candidate.arguments.clear(); candidate.definitions.clear(); candidate.order.clear();
         for &value in &candidate.starts {
             candidate.definitions.insert(value, Expr { value, a: -1, b: -1, op: 0, cost: 0 });
@@ -348,11 +354,11 @@ mod engine {
             replay.load_hint(&program).ok()?;
             *best = program;
         }
-        Some(JointState { choices, cost, active, hash })
+        Some(JointState { choices, target_order: target_order.to_vec(), cost, active, hash })
     }
 
     fn insert_beam(beam: &mut Vec<JointState>, state: JointState, width: usize) {
-        if beam.iter().any(|old| old.hash == state.hash) { return; }
+        if beam.iter().any(|old| old.hash == state.hash && old.target_order == state.target_order) { return; }
         let position = beam.partition_point(|old| (old.cost, old.active.len(), old.hash) <= (state.cost, state.active.len(), state.hash));
         beam.insert(position, state);
         if beam.len() > width { beam.pop(); }
@@ -377,7 +383,7 @@ mod engine {
     }
 
     fn helper_neighborhood(puzzle: &Puzzle, graph: &JointGraph, best: &mut Program,
-                           beam: &mut Vec<JointState>, seen: &mut BTreeSet<u64>, width: usize,
+                           beam: &mut Vec<JointState>, seen: &mut Seen, width: usize,
                            budget: usize, deadline: Instant, trace: &mut JointTrace) -> usize {
         if graph.helpers.is_empty() || beam.is_empty() || budget == 0 { return 0; }
         let costs = exclusive_costs(graph, &beam[0]);
@@ -414,7 +420,7 @@ mod engine {
                     for (node, route) in subset { choices[node] = route; }
                     let previous = best.len();
                     used += 1; trace.macros += 1;
-                    if let Some(state) = evaluate(puzzle, graph, choices, best, seen, deadline) {
+                    if let Some(state) = evaluate(puzzle, graph, choices, &parent.target_order, best, seen, deadline) {
                         insert_beam(beam, state, width);
                     }
                     if best.len() < previous { trace.improvements += 1; }
@@ -424,8 +430,129 @@ mod engine {
         used
     }
 
+    // These are heuristic expression-tree costs, not an optimal DAG bound.
+    // A settled route costs one plus its distinct operands' costs, therefore
+    // every non-prefix parent has strictly smaller cost than its result.
+    fn planner_costs(graph: &JointGraph, built: &[bool], watchers: &[Vec<(usize, usize)>],
+                     salt: u64, deadline: Instant) -> Option<(Vec<usize>, Vec<u16>)> {
+        let infinity = usize::MAX / 4;
+        let mut costs = vec![infinity; graph.values.len()];
+        let mut choices = vec![0u16; graph.values.len()];
+        let mut remaining: Vec<Vec<u8>> = graph.recipes.iter().map(|rules| rules.iter()
+            .map(|rule| if rule.a == rule.b { 1 } else { 2 }).collect()).collect();
+        let mut sums: Vec<Vec<usize>> = graph.recipes.iter().map(|rules| vec![1; rules.len()]).collect();
+        let mut settled = vec![false; graph.values.len()];
+        let mut queue = BinaryHeap::new();
+        for (node, &available) in built.iter().enumerate() {
+            if available { costs[node] = 0; queue.push(Reverse((0usize, node))); }
+        }
+        let tie = |node: usize, choice: usize| {
+            if salt == 0 { return choice as u64; }
+            let mut value = (node as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ choice as u64 ^ salt;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb)
+        };
+        let mut examined = 0usize;
+        while let Some(Reverse((cost, node))) = queue.pop() {
+            if cost != costs[node] || settled[node] { continue; }
+            settled[node] = true;
+            for &(result, choice) in &watchers[node] {
+                examined += 1;
+                if examined & 255 == 0 && Instant::now() >= deadline { return None; }
+                remaining[result][choice] -= 1;
+                sums[result][choice] = sums[result][choice].saturating_add(cost).min(infinity);
+                if remaining[result][choice] != 0 || built[result] { continue; }
+                let candidate = sums[result][choice];
+                if candidate < costs[result] || (candidate < infinity && candidate == costs[result] &&
+                    tie(result, choice) < tie(result, choices[result] as usize)) {
+                    let changed_cost = candidate < costs[result];
+                    costs[result] = candidate; choices[result] = choice as u16;
+                    if changed_cost { queue.push(Reverse((candidate, result))); }
+                }
+            }
+        }
+        Some((costs, choices))
+    }
+
+    fn materialize_plan(graph: &JointGraph, target: usize, routes: &[u16], costs: &[usize],
+                        built: &mut [bool], choices: &mut [u16], deadline: Instant) -> Option<()> {
+        let mut stack = vec![(target, false)];
+        while let Some((node, leaving)) = stack.pop() {
+            if Instant::now() >= deadline { return None; }
+            if built[node] { continue; }
+            let choice = routes[node] as usize;
+            let rule = graph.recipes[node].get(choice)?;
+            if leaving { choices[node] = choice as u16; built[node] = true; continue; }
+            if costs[node] >= usize::MAX / 4 || costs[rule.a] >= costs[node] || costs[rule.b] >= costs[node] { return None; }
+            stack.push((node, true)); stack.push((rule.b, false)); stack.push((rule.a, false));
+        }
+        Some(())
+    }
+
+    fn recipe_plans(puzzle: &Puzzle, graph: &JointGraph, count: usize, seed: u64,
+                     best: &mut Program, beam: &mut Vec<JointState>, seen: &mut Seen,
+                     width: usize, deadline: Instant, trace: &mut JointTrace) {
+        if count == 0 || Instant::now() >= deadline { return; }
+        let mut watchers = vec![Vec::new(); graph.values.len()];
+        for (result, rules) in graph.recipes.iter().enumerate() {
+            if result & 63 == 0 && Instant::now() >= deadline { return; }
+            for (choice, rule) in rules.iter().enumerate() {
+                watchers[rule.a].push((result, choice));
+                if rule.a != rule.b { watchers[rule.b].push((result, choice)); }
+            }
+        }
+        let mut rng = Mt19937_64::new(seed);
+        for plan in 0..count {
+            if Instant::now() >= deadline { return; }
+            let mut built = graph.seeds.clone();
+            let mut choices = vec![0u16; graph.values.len()];
+            let mut scheduled = vec![false; graph.values.len()];
+            let mut schedule = Vec::new();
+            for &target in &graph.targets {
+                if built[target] && !scheduled[target] { scheduled[target] = true; schedule.push(target); }
+            }
+            let mut viable = true;
+            loop {
+                let pending: Vec<usize> = graph.targets.iter().copied().filter(|&target| !built[target]).collect();
+                if pending.is_empty() { break; }
+                let salt = if plan == 0 { 0 } else { seed.wrapping_add((plan as u64).wrapping_mul(0x9e3779b97f4a7c15)) };
+                let (costs, routes) = match planner_costs(graph, &built, &watchers, salt, deadline) {
+                    Some(result) => result, None => return,
+                };
+                let mut ranked = pending.clone(); ranked.sort_by_key(|&target| (costs[target], target));
+                if costs[ranked[0]] >= usize::MAX / 4 { viable = false; break; }
+                let target = match plan % 8 {
+                    1 => pending[0], 2 => *pending.last().unwrap(),
+                    3 => ranked[(rng.next() as usize) % ranked.len().min(6)],
+                    4 => *ranked.last().unwrap(),
+                    5 => *pending.iter().min().unwrap(),
+                    6 => *pending.iter().max().unwrap(),
+                    7 => pending[(rng.next() as usize) % pending.len()],
+                    _ => ranked[0],
+                };
+                if materialize_plan(graph, target, &routes, &costs, &mut built, &mut choices, deadline).is_none() {
+                    if Instant::now() >= deadline { return; }
+                    viable = false; break;
+                }
+                for &target in &graph.targets {
+                    if built[target] && !scheduled[target] { scheduled[target] = true; schedule.push(target); }
+                }
+                // Every route ends at the already pinned closed prefix. Any
+                // other required target built along that route is covered too.
+            }
+            if !viable { continue; }
+            trace.plans += 1;
+            let previous = best.len();
+            let target_order: Vec<Int> = schedule.into_iter().map(|node| graph.values[node]).collect();
+            if let Some(state) = evaluate(puzzle, graph, choices, &target_order, best, seen, deadline) {
+                insert_beam(beam, state, width);
+            }
+            if best.len() < previous { trace.improvements += 1; }
+        }
+    }
+
     fn optimize(puzzle: &Puzzle, programs: &[Program], seed: u64, evaluations: usize,
-                width: usize, exact_values: usize, milliseconds: u64, helpers: usize) -> Outcome<Program> {
+                width: usize, exact_values: usize, milliseconds: u64, helpers: usize, plans: usize) -> Outcome<Program> {
         let deadline = Instant::now() + Duration::from_millis(milliseconds);
         let mut trace = JointTrace::new();
         if programs.is_empty() { return Err("no hint programs".into()); }
@@ -436,10 +563,11 @@ mod engine {
         trace.helpers = graph.helpers.len();
         let mut seen = BTreeSet::new();
         let mut beam = Vec::new();
+        recipe_plans(puzzle, &graph, plans, seed, &mut best, &mut beam, &mut seen, width, deadline, &mut trace);
         for choices in &graph.sources {
             if Instant::now() >= deadline { return Ok(best); }
             let previous = best.len();
-            if let Some(state) = evaluate(puzzle, &graph, choices.clone(), &mut best, &mut seen, deadline) {
+            if let Some(state) = evaluate(puzzle, &graph, choices.clone(), &puzzle.targets, &mut best, &mut seen, deadline) {
                 insert_beam(&mut beam, state, width);
             }
             if best.len() < previous { trace.improvements += 1; }
@@ -492,7 +620,7 @@ mod engine {
                         }
                     }
                     let previous = best.len();
-                    if let Some(state) = evaluate(puzzle, &graph, choices, &mut best, &mut seen, deadline) {
+                    if let Some(state) = evaluate(puzzle, &graph, choices, &parent.target_order, &mut best, &mut seen, deadline) {
                         insert_beam(&mut beam, state, width);
                         accepted += 1;
                     }
@@ -503,6 +631,98 @@ mod engine {
             if accepted == 0 && generation > 4 { break; }
         }
         Ok(best)
+    }
+
+    #[cfg(test)]
+    mod joint_schedule_tests {
+        use super::*;
+
+        fn fixture() -> (Puzzle, JointGraph) {
+            let puzzle = Puzzle { limit: 100, starts: vec![2, 5], targets: vec![14, 35],
+                definitions: BTreeMap::new(), arguments: BTreeMap::new(), order: Vec::new() };
+            let graph = JointGraph { values: vec![2, 4, 5, 7, 10, 14, 25, 35],
+                recipes: vec![vec![], vec![Recipe { op: b'+', a: 0, b: 0 }], vec![],
+                    vec![Recipe { op: b'+', a: 0, b: 2 }], vec![Recipe { op: b'+', a: 2, b: 2 }],
+                    vec![Recipe { op: b'+', a: 1, b: 4 }, Recipe { op: b'*', a: 3, b: 0 }],
+                    vec![Recipe { op: b'*', a: 2, b: 2 }],
+                    vec![Recipe { op: b'+', a: 6, b: 4 }, Recipe { op: b'*', a: 3, b: 2 }]],
+                seeds: vec![true, false, true, false, false, false, false, false],
+                targets: vec![5, 7], sources: vec![vec![0; 8]],
+                helpers: vec![JointHelper { node: 3, consumers: vec![(5, vec![1]), (7, vec![1])] }] };
+            (puzzle, graph)
+        }
+
+        #[test]
+        fn same_dag_with_two_target_orders_remains_distinct() {
+            let (puzzle, graph) = fixture();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut best = vec![[0; 4]; 6];
+            let mut beam = Vec::new();
+            let mut seen = Seen::new();
+            recipe_plans(&puzzle, &graph, 3, 0, &mut best, &mut beam, &mut seen, 8,
+                         deadline, &mut JointTrace::new());
+            assert_eq!(beam.len(), 2);
+            assert_eq!(seen.len(), 2);
+            assert_eq!(beam[0].choices, beam[1].choices);
+            assert_eq!(beam[0].hash, graph_hash(&beam[0].choices));
+            assert_eq!(beam[0].hash, beam[1].hash);
+            assert_eq!(beam[0].target_order, vec![14, 35]);
+            assert_eq!(beam[1].target_order, vec![35, 14]);
+            assert!(evaluate(&puzzle, &graph, beam[1].choices.clone(), &beam[1].target_order,
+                             &mut best, &mut seen, deadline).is_none());
+            let duplicate = beam[0].clone();
+            insert_beam(&mut beam, duplicate, 8);
+            assert_eq!(beam.len(), 2);
+        }
+
+        #[test]
+        fn helper_descendant_preserves_and_compiles_parent_target_order() {
+            let (puzzle, graph) = fixture();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut best = vec![[0; 4]; 6];
+            let mut seen = Seen::new();
+            let parent = evaluate(&puzzle, &graph, graph.sources[0].clone(), &[35, 14],
+                                  &mut best, &mut seen, deadline).unwrap();
+            assert_eq!(parent.cost, 5);
+            let mut beam = vec![parent];
+            assert_eq!(helper_neighborhood(&puzzle, &graph, &mut best, &mut beam, &mut seen, 8,
+                                          1, deadline, &mut JointTrace::new()), 1);
+            assert_eq!(beam[0].cost, 3);
+            assert_ne!(beam[0].choices, graph.sources[0]);
+            assert!(beam.iter().all(|state| state.target_order == vec![35, 14]));
+            let mut bank = [0; 48];
+            bank[..puzzle.starts.len()].copy_from_slice(&puzzle.starts);
+            let produced: Vec<Int> = best.iter().map(|&[op, a, b, destination]| {
+                let value = apply(op as u8, bank[a as usize], bank[b as usize]).unwrap();
+                bank[destination as usize] = value;
+                value
+            }).collect();
+            assert_eq!(produced, vec![7, 35, 14]);
+        }
+    }
+
+    #[cfg(test)]
+    mod planner_tests {
+        use super::*;
+
+        #[test]
+        fn duplicate_operands_are_charged_once_and_constructed_prefix_is_pinned() {
+            let graph = JointGraph { values: vec![2, 4, 16],
+                recipes: vec![vec![], vec![Recipe { op: b'+', a: 0, b: 0 }],
+                              vec![Recipe { op: b'*', a: 1, b: 1 }]],
+                seeds: vec![true, false, false], targets: vec![2], sources: vec![vec![0; 3]], helpers: vec![] };
+            let watchers = vec![vec![(1, 0)], vec![(2, 0)], vec![]];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (costs, _) = planner_costs(&graph, &graph.seeds, &watchers, 0, deadline).unwrap();
+            assert_eq!(costs, vec![0, 1, 2]);
+            let mut built = vec![true, true, false];
+            let mut pinned = vec![0; 3];
+            let (costs, routes) = planner_costs(&graph, &built, &watchers, 0, deadline).unwrap();
+            assert_eq!(costs, vec![0, 0, 1]);
+            materialize_plan(&graph, 2, &routes, &costs, &mut built, &mut pinned, deadline).unwrap();
+            assert!(built.iter().all(|&value| value));
+            assert_eq!(pinned[1], 0);
+        }
     }
 
     #[cfg(test)]
@@ -546,7 +766,8 @@ mod engine {
         let exact_values = parameter(&args, 4, 1024usize)?;
         let milliseconds = parameter(&args, 5, 2000u64)?;
         let helpers = parameter(&args, 6, 0usize)?;
-        if evaluations > 1_000_000 || width == 0 || width > 64 || exact_values > 4096 || milliseconds == 0 || milliseconds > 120_000 || helpers > 24 {
+        let plans = parameter(&args, 7, 0usize)?;
+        if evaluations > 1_000_000 || width == 0 || width > 64 || exact_values > 4096 || milliseconds == 0 || milliseconds > 120_000 || helpers > 24 || plans > 256 {
             return Err("invalid joint search budget".into());
         }
         let stdin = io::stdin(); let stdout = io::stdout();
@@ -576,7 +797,7 @@ mod engine {
                 programs.push(program);
             }
             let puzzle = Puzzle { limit, starts, targets, definitions: BTreeMap::new(), arguments: BTreeMap::new(), order: Vec::new() };
-            let best = optimize(&puzzle, &programs, seed, evaluations, width, exact_values, milliseconds, helpers)?;
+            let best = optimize(&puzzle, &programs, seed, evaluations, width, exact_values, milliseconds, helpers, plans)?;
             write!(writer, "{} [", id).map_err(|error| error.to_string())?;
             for (index, instruction) in best.iter().enumerate() {
                 if index > 0 { write!(writer, ",").map_err(|error| error.to_string())?; }

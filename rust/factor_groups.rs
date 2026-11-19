@@ -5,6 +5,7 @@
 // Same mode-6 hint protocol and positional arguments as repair.rs.
 // SANTA2026_GROUPS_MS (or SANTA2026_OPTIMIZER_MS) sets the per-puzzle
 // cooperative budget in milliseconds; default 2000, allowed 1..600000.
+// SANTA2026_GROUPS_DIRECT=1 instead rebuilds one full exclusive target cone.
 
 #[allow(dead_code)]
 mod engine {
@@ -18,6 +19,7 @@ mod engine {
         groups: usize,
         searches: usize,
         accepted: usize,
+        direct: bool,
     }
 
     impl Budget {
@@ -31,8 +33,13 @@ mod engine {
             if milliseconds == 0 || milliseconds > 600_000 {
                 return Err("factor-group budget must be within 1..600000 milliseconds".into());
             }
+            let direct = match env::var("SANTA2026_GROUPS_DIRECT").as_deref() {
+                Ok("1") => true,
+                Ok("0") | Err(_) => false,
+                _ => return Err("factor-group direct option must be 0 or 1".into()),
+            };
             Ok(Self { started: Instant::now(), duration: Duration::from_millis(milliseconds),
-                groups: 0, searches: 0, accepted: 0 })
+                groups: 0, searches: 0, accepted: 0, direct })
         }
         fn available(&self) -> bool { self.started.elapsed() < self.duration }
     }
@@ -156,6 +163,33 @@ mod engine {
         Ok(retained)
     }
 
+    fn ranked_direct(puzzle: &Puzzle, seed: u64, budget: &Budget) -> Vec<Group> {
+        let targets: BTreeSet<Int> = puzzle.targets.iter().copied()
+            .filter(|value| !puzzle.starts.contains(value)).collect();
+        let mut closure = BTreeMap::new();
+        let mut users: BTreeMap<Int, usize> = BTreeMap::new();
+        for &target in &targets {
+            if !budget.available() { return Vec::new(); }
+            let needed = ancestors(puzzle, [target]);
+            for &value in &needed { *users.entry(value).or_default() += 1; }
+            closure.insert(target, needed);
+        }
+        let mut groups = Vec::new();
+        for target in targets {
+            let exclusive = closure[&target].iter().filter(|value|
+                puzzle.arguments.contains_key(value) && users[value] == 1).count();
+            if exclusive > 1 {
+                groups.push(Group { factor: 1, targets: vec![target], exclusive, novel: false });
+            }
+        }
+        groups.sort_by_key(|group| (std::cmp::Reverse(group.exclusive), group.targets[0]));
+        if !groups.is_empty() {
+            let shift = (seed % groups.len() as u64) as usize;
+            groups.rotate_left(shift);
+        }
+        groups
+    }
+
     fn leaves(puzzle: &Puzzle, priority: &[Int], config: &Config, reverse: bool) -> Vec<Int> {
         let mut result = Vec::new();
         let mut used = BTreeSet::new();
@@ -273,22 +307,31 @@ mod engine {
             .filter(|(value, _)| !trial.definitions.contains_key(value))
             .flat_map(|(_, &(a, b))| [a, b]).filter(|value| trial.definitions.contains_key(value)).collect();
         let mut priority: Vec<Int> = boundary.into_iter().collect();
-        if !construct(&mut trial, group.factor, &priority, config, reverse, budget)? { return Ok(None); }
-        priority.insert(0, group.factor);
-        let mut targets = group.targets.clone();
-        if reverse { targets.reverse(); }
-        for target in targets {
-            let quotient = target / group.factor;
-            if !construct(&mut trial, quotient, &priority, config, reverse, budget)? { return Ok(None); }
-            if target != group.factor {
-                // A newly searched factor/quotient may incidentally reproduce
-                // an old target. Do not replace its recipe with a cyclic one.
-                if ancestors(&trial, [group.factor, quotient]).contains(&target) { return Ok(None); }
-                trial.definitions.insert(target, Expr { value: target, a: -1, b: -1, op: b'*', cost: 0 });
-                trial.arguments.insert(target, (group.factor, quotient));
-                if !trial.order.contains(&target) { trial.order.push(target); }
+        if group.factor == 1 {
+            // Rebuild directly after deleting the entire private cone. Keeping
+            // the old private parents here would make the old final operation
+            // look like a free one-step terminal again. No redundant 1*t is
+            // emitted: the target keeps its newly searched, paid recipe.
+            if group.targets.len() != 1 { return Err("direct group requires one target".into()); }
+            if !construct(&mut trial, group.targets[0], &priority, config, reverse, budget)? { return Ok(None); }
+        } else {
+            if !construct(&mut trial, group.factor, &priority, config, reverse, budget)? { return Ok(None); }
+            priority.insert(0, group.factor);
+            let mut targets = group.targets.clone();
+            if reverse { targets.reverse(); }
+            for target in targets {
+                let quotient = target / group.factor;
+                if !construct(&mut trial, quotient, &priority, config, reverse, budget)? { return Ok(None); }
+                if target != group.factor {
+                    // A newly searched factor/quotient may incidentally reproduce
+                    // an old target. Do not replace its recipe with a cyclic one.
+                    if ancestors(&trial, [group.factor, quotient]).contains(&target) { return Ok(None); }
+                    trial.definitions.insert(target, Expr { value: target, a: -1, b: -1, op: b'*', cost: 0 });
+                    trial.arguments.insert(target, (group.factor, quotient));
+                    if !trial.order.contains(&target) { trial.order.push(target); }
+                }
+                priority.insert(1, quotient); priority.insert(1, target);
             }
-            priority.insert(1, quotient); priority.insert(1, target);
         }
         // Restoring only absent definitions retains new shared recipes while
         // repairing all downstream outputs removed with the blocked roots.
@@ -317,7 +360,9 @@ mod engine {
             puzzle.definitions.retain(|value, _| live.contains(value));
             puzzle.arguments.retain(|value, _| live.contains(value));
             puzzle.order.retain(|value| live.contains(value));
-            let groups = ranked_groups(puzzle, config.seed.wrapping_add(pass as u64), budget);
+            let seed = config.seed.wrapping_add(pass as u64);
+            let groups = if budget.direct { ranked_direct(puzzle, seed, budget) }
+                         else { ranked_groups(puzzle, seed, budget) };
             let mut improved = false;
             for group in groups.iter().take(config.trials) {
                 if !budget.available() { break; }
@@ -380,9 +425,9 @@ mod engine {
             writeln!(writer, "]").map_err(|error| error.to_string())?;
             writer.flush().map_err(|error| error.to_string())?;
             if env::var_os("SANTA2026_GROUPS_TRACE").is_some() {
-                eprintln!("groups id={} before={} after={} groups={} searches={} accepted={} elapsed_ms={}",
+                eprintln!("groups id={} before={} after={} groups={} searches={} accepted={} elapsed_ms={} direct={}",
                     id, hint.len(), best.len(), budget.groups, budget.searches, budget.accepted,
-                    budget.started.elapsed().as_millis());
+                    budget.started.elapsed().as_millis(), budget.direct);
             }
         }
         Ok(())
@@ -399,7 +444,8 @@ mod engine {
             Config { width: 3, alpha: 0.18, n_done: 32, n_recent: 40, bits: 14, seed: 0, trials: 4, passes: 1 }
         }
         fn budget() -> Budget {
-            Budget { started: Instant::now(), duration: Duration::from_secs(5), groups: 0, searches: 0, accepted: 0 }
+            Budget { started: Instant::now(), duration: Duration::from_secs(5), groups: 0, searches: 0, accepted: 0,
+                direct: false }
         }
         #[test]
         fn synthesizes_an_unseen_shared_factor_for_three_outputs() {
@@ -464,6 +510,26 @@ mod engine {
             let next = ranked_groups(&game, 1, &budget());
             assert!(first.len() >= 2);
             assert_eq!(first[1].factor, next[0].factor);
+        }
+        #[test]
+        fn direct_mode_replaces_a_full_private_cone_with_an_outside_bridge() {
+            let mut game = puzzle(vec![3,5], vec![17,65], 100);
+            let hint = vec![[43,0,1,2],[43,2,2,3],[47,0,0,4],[43,3,4,5],
+                [43,4,4,6],[43,6,6,7],[42,7,1,8],[43,8,8,9],[43,9,8,10],[43,10,1,11]];
+            let original = optimize(&mut game, &hint, &config(), &mut budget()).unwrap();
+            assert_eq!(original, hint); // The default GCD mode still skips gcd(17,65)=1.
+            let mut limits = budget(); limits.direct = true;
+            let mut settings = config(); settings.trials = 1;
+            game.load_hint(&hint).unwrap();
+            let groups = ranked_direct(&game, 0, &limits);
+            assert_eq!(groups[0].targets, vec![65]);
+            assert_eq!(groups[0].exclusive, 6);
+            let context = retained_context(&game, &groups[0]).unwrap();
+            for private in [2,4,20,40,60,65] { assert!(!context.definitions.contains_key(&private)); }
+            for retained in [1,8,16,17] { assert!(context.definitions.contains_key(&retained)); }
+            let result = optimize(&mut game, &hint, &settings, &mut limits).unwrap();
+            assert_eq!(result.len(), 6); // Retained4 + square(8) + add1.
+            game.load_hint(&result).unwrap();
         }
     }
 }

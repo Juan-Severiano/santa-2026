@@ -103,3 +103,44 @@ shared temporary values at their real emitted cost, and examine the product
 neighbor above an exact floor quotient. A value reached by several plans keeps
 the cheapest actual plan. In particular a shared P2+P2 diamond can cost four
 operations rather than its five-operation tree expansion.
+
+## Whole-graph neighborhood search
+
+`lns.rs` adapts goodpjw2008's Apache-2.0 value-DAG optimizer, with the original
+prvsiyan design credit. It removes the private cone of a target or shared
+intermediate, excludes dependent descendants from the external context, and
+rebuilds against every remaining graph value. Arithmetic inversions include
+exact final divisions whose numerator exceeds the target. One-step tables,
+three-operation joins, bounded four-operation joins and five-operation
+near-miss products propose replacements. This is a bounded heuristic, with no
+global optimality guarantee: four-operation search aborts above 750,000 needed
+values, and the product search examines four neighbors near the quotient.
+
+Equal-cost moves and perturbations explore different graphs while retaining
+the best program separately. Identical reconstruction of the current root is
+skipped, and shared temporary operations are charged once. Topological
+scheduling prioritizes the original instruction order, releases dead starting
+values, enforces 48 real registers and replays the complete candidate.
+
+```sh
+python3 scripts/build_native.py --engine rust --source rust/lns.rs --output outputs/bin/lns-rust
+rustc --edition=2021 --test -O rust/lns.rs -o outputs/bin/lns-tests
+outputs/bin/lns-tests
+```
+
+Arguments: `seed milliseconds flags`, defaults `0 2000 15`. The budget is
+1–600,000 milliseconds. Feature bits are 1 for helper roots, 2 for equal-cost
+moves, 4 for depth-five products, and 8 for perturbations. It uses the existing
+single-hint input and one-line `id JSON-program` output protocol. Search checks
+a soft deadline; the Python controller enforces the outer wall-time limit.
+
+`SANTA2026_LNS_ARCHIVE=/path/archive.json` optionally writes up to eight
+replay-valid, recipe-diverse trajectory programs, each at most best+2
+instructions. The sidecar is atomic and stdout still contains only the best
+program. `scripts/rust_quality.py --methods lns --lns-archive` validates and
+exports these alternatives as complete `lns-generated-N.csv` portfolios;
+their scores are reported separately from best-score improvements.
+`scripts/lab.py --strategies recombinecross --candidates ...` recombines their
+observed values, adds legal arithmetic edges, and enforces acyclic selection
+with optional OR-Tools CP-SAT. The search itself remains Rust; Python handles
+orchestration, model assembly and independent exact validation.

@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from santa2026.core import Puzzle, validate_program
-from santa2026.recombine import _make_model, _union, optimize_recombine
+from santa2026.recombine import _cross_recipes, _make_model, _union, optimize_recombine, optimize_recombine_cross
 
 try:
     from ortools.sat.python import cp_model
@@ -25,6 +25,30 @@ class RecombineTests(unittest.TestCase):
         validate_program(puzzle, result)
         self.assertEqual(len(result), 3)
         self.assertTrue(all(len(result) < len(program) for program in programs))
+
+    @unittest.skipIf(cp_model is None, "optional OR-Tools is not installed")
+    def test_cross_edges_find_a_route_never_observed_in_any_input(self):
+        puzzle = Puzzle("cross-edges", (2, 5), (8, 10), 10)
+        original = [["+", 0, 0, 2], ["+", 2, 2, 3], ["+", 3, 0, 4]]
+        self.assertEqual(len(optimize_recombine(puzzle, [original])), 3)
+        result = optimize_recombine_cross(puzzle, [original])
+        validate_program(puzzle, result)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(len(original), 3)
+
+    @unittest.skipIf(cp_model is None, "optional OR-Tools is not installed")
+    def test_cross_edges_still_forbid_circular_derivations(self):
+        puzzle = Puzzle("cross-cycle", (2, 5), (8, 10), 10)
+        original = [["+", 0, 0, 2], ["+", 2, 2, 3], ["+", 3, 0, 4]]
+        recipes, _, warm, levels = _union(puzzle, [original])
+        recipes = _cross_recipes(puzzle, recipes)
+        model, _, variables, _ = _make_model(puzzle, recipes, warm, levels, cp_model)
+        model.add(variables[8, ("-", 10, 2)] == 1)
+        model.add(variables[10, ("+", 2, 8)] == 1)
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 1
+        solver.parameters.num_search_workers = 1
+        self.assertEqual(solver.solve(model), cp_model.INFEASIBLE)
 
     @unittest.skipIf(cp_model is None, "optional OR-Tools is not installed")
     def test_union_cycles_cannot_be_selected(self):

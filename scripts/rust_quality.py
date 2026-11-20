@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Bounded, interleaved quality experiments for the three Rust search methods."""
+"""Bounded, replay-validated quality experiments for the Rust search methods."""
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import resource
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,7 +44,25 @@ def payload(puzzle, programs, joint=False):
     return " ".join(map(str, fields)) + "\n"
 
 
-def search(name, binary, puzzle, original, candidates, seconds, joint_helpers=0, tail_boundary=False, groups_direct=False, joint_plans=0, window_rename=False):
+def read_lns_archive(path, puzzle):
+    """Accept only a complete, replay-valid sidecar; never salvage a partial one."""
+    value = json.loads(path.read_text())
+    if type(value) is not dict or set(value) != {"version", "id", "programs"}:
+        raise ValueError("invalid LNS archive fields")
+    if type(value["version"]) is not int or value["version"] != 1 or value["id"] != "puzzle":
+        raise ValueError("invalid LNS archive version or id")
+    programs = value["programs"]
+    if type(programs) is not list or len(programs) > 8:
+        raise ValueError("LNS archive must contain at most eight programs")
+    result = []
+    for program in programs:
+        validate_program(puzzle, program)
+        if program not in result:
+            result.append(program)
+    return result
+
+
+def search(name, binary, puzzle, original, candidates, seconds, joint_helpers=0, tail_boundary=False, groups_direct=False, joint_plans=0, window_rename=False, lns_flags=15, lns_seed=0, lns_archive=False):
     best = [instruction[:] for instruction in original]
     generated = []
     lower_bound = len(set(puzzle.targets) - set(puzzle.starting_values))
@@ -54,7 +74,14 @@ def search(name, binary, puzzle, original, candidates, seconds, joint_helpers=0,
         if remaining < .03 or (name != "construct" and len(best) == lower_bound):
             break
         environment = os.environ.copy()
-        if name in ("window", "construct"):
+        environment.pop("SANTA2026_LNS_ARCHIVE", None)
+        if name == "lns":
+            # Plateau walking needs one continuous trajectory, rather than a
+            # restart every two seconds. Leave time for output and replay.
+            milliseconds = max(1, int(max(.001, remaining - .1) * 970))
+            command = [str(binary), str(lns_seed + index), str(milliseconds), str(lns_flags)]
+            data = payload(puzzle, [best])
+        elif name in ("window", "construct"):
             milliseconds = max(1, int(min(2, remaining - .02) * 1000))
             if name == "window":
                 command = [str(binary), str(index), "24", "32", "96", str(milliseconds)]
@@ -90,29 +117,47 @@ def search(name, binary, puzzle, original, candidates, seconds, joint_helpers=0,
         attempt_started = time.perf_counter()
         record = {"index": index, "command": command}
         program = None
-        try:
-            result = subprocess.run(command, input=data, text=True, capture_output=True,
-                                    timeout=remaining, env=environment)
-            record["returncode"] = result.returncode
-            if result.stderr.strip():
-                record["diagnostics"] = result.stderr.strip()[-2000:]
-            if result.returncode:
-                record["error"] = f"engine exited {result.returncode}: {result.stderr.strip()[-2000:]}"
-            program = read_program_output(result.stdout, puzzle, require_complete=bool(result.returncode))
-            if program is None and not result.returncode:
-                raise ValueError("missing native program response")
-            if program is not None and result.returncode:
-                record["recovered_complete_output"] = True
-        except subprocess.TimeoutExpired as error:
-            record["budget_exhausted"] = True
+        archive_enabled = name == "lns" and lns_archive
+        directory = tempfile.TemporaryDirectory(prefix="santa2026-lns-archive-") if archive_enabled else nullcontext(None)
+        with directory as archive_directory:
+            archive_path = Path(archive_directory) / "archive.json" if archive_enabled else None
+            if archive_path is not None:
+                environment["SANTA2026_LNS_ARCHIVE"] = str(archive_path)
             try:
-                program = read_program_output(error.stdout, puzzle, require_complete=True)
-                if program is not None:
+                result = subprocess.run(command, input=data, text=True, capture_output=True,
+                                        timeout=remaining, env=environment)
+                record["returncode"] = result.returncode
+                if result.stderr.strip():
+                    record["diagnostics"] = result.stderr.strip()[-2000:]
+                if result.returncode:
+                    record["error"] = f"engine exited {result.returncode}: {result.stderr.strip()[-2000:]}"
+                program = read_program_output(result.stdout, puzzle, require_complete=bool(result.returncode))
+                if program is None and not result.returncode:
+                    raise ValueError("missing native program response")
+                if program is not None and result.returncode:
                     record["recovered_complete_output"] = True
+            except subprocess.TimeoutExpired as error:
+                record["budget_exhausted"] = True
+                try:
+                    program = read_program_output(error.stdout, puzzle, require_complete=True)
+                    if program is not None:
+                        record["recovered_complete_output"] = True
+                except (ValueError, TypeError, RecursionError) as exc:
+                    record["error"] = "invalid complete timed output: " + str(exc)
             except (ValueError, TypeError, RecursionError) as exc:
-                record["error"] = "invalid complete timed output: " + str(exc)
-        except (ValueError, TypeError, RecursionError) as exc:
-            record["error"] = str(exc)
+                record["error"] = str(exc)
+            if archive_path is not None:
+                try:
+                    archived = read_lns_archive(archive_path, puzzle)
+                    record["archive_programs"] = len(archived)
+                    record["archive_instructions"] = list(map(len, archived))
+                    for candidate in archived:
+                        if candidate not in generated and len(generated) < 8:
+                            generated.append(candidate)
+                        if len(candidate) < len(best):
+                            best = candidate
+                except (OSError, ValueError, TypeError, RecursionError) as exc:
+                    record["archive_error"] = str(exc)
         if program is not None:
             record["instructions"] = len(program)
             if name == "construct" and program not in generated:
@@ -125,7 +170,7 @@ def search(name, binary, puzzle, original, candidates, seconds, joint_helpers=0,
         record["wall_seconds"] = time.perf_counter() - attempt_started
         record["cpu_seconds"] = after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime
         attempts.append(record)
-        if record.get("budget_exhausted"):
+        if name == "lns" or record.get("budget_exhausted"):
             break
     validate_program(puzzle, best)
     return {"id": puzzle.id, "engine": name, "baseline_instructions": len(original),
@@ -147,18 +192,22 @@ def main():
     parser.add_argument("--groups", type=Path, default=Path("outputs/bin/factor-groups-rust"))
     parser.add_argument("--window", type=Path, default=Path("outputs/bin/window-rust"))
     parser.add_argument("--construct", type=Path, default=Path("outputs/bin/construct-rust"))
+    parser.add_argument("--lns", type=Path, default=Path("outputs/bin/lns-rust"))
     parser.add_argument("--seconds", type=float, default=4)
-    parser.add_argument("--methods", choices=("repair", "tail", "joint", "groups", "window", "construct"), nargs="+", default=["repair", "tail", "joint"])
+    parser.add_argument("--methods", choices=("repair", "tail", "joint", "groups", "window", "construct", "lns"), nargs="+", default=["repair", "tail", "joint"])
     parser.add_argument("--joint-helpers", type=int, default=0)
     parser.add_argument("--joint-plans", type=int, default=0)
     parser.add_argument("--tail-boundary", action="store_true")
     parser.add_argument("--groups-direct", action="store_true", help="Resynthesize one complete private cone from safe outside context")
     parser.add_argument("--window-rename", action="store_true", help="Match physical live-outs up to a bijective suffix register renaming")
+    parser.add_argument("--lns-flags", type=int, default=15, help="LNS feature bits: 1 helper roots, 2 plateau moves, 4 depth-five near misses, 8 kicks")
+    parser.add_argument("--lns-seed", type=int, default=0)
+    parser.add_argument("--lns-archive", action="store_true", help="Keep up to eight replay-valid LNS trajectory programs per puzzle")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.seconds <= 0:
         parser.error("seconds must be positive")
-    if len(set(args.methods)) != len(args.methods) or args.joint_helpers < 0 or not 0 <= args.joint_plans <= 256:
+    if len(set(args.methods)) != len(args.methods) or args.joint_helpers < 0 or not 0 <= args.joint_plans <= 256 or not 0 <= args.lns_flags <= 15 or not 0 <= args.lns_seed < 2**64 - 64:
         parser.error("methods must be unique and helper budget nonnegative")
     puzzles = read_puzzles(args.puzzles)
     by_id = {p.id: p for p in puzzles}
@@ -181,6 +230,7 @@ def main():
                      "groups_direct": args.groups_direct,
                      "joint_plans": args.joint_plans,
                      "window_rename": args.window_rename,
+                     "lns_flags": args.lns_flags, "lns_seed": args.lns_seed, "lns_archive": args.lns_archive,
                      "trace_environment": {name: os.environ.get(name) == "1" for name in
                          ("SANTA2026_JOINT_TRACE", "SANTA2026_OPTIMIZER_TRACE", "SANTA2026_GROUPS_TRACE", "SANTA2026_WINDOW_TRACE")},
                      "binaries": {name: digest(path) for name, path in engines.items()},
@@ -214,7 +264,7 @@ def main():
                 record = search(name, engines[name], by_id[identifier], baseline[identifier],
                                 [programs[identifier] for programs in candidates], args.seconds,
                                 args.joint_helpers, args.tail_boundary, args.groups_direct, args.joint_plans,
-                                args.window_rename)
+                                args.window_rename, args.lns_flags, args.lns_seed, args.lns_archive)
                 record["signature"] = signature
                 atomic_json(path, record)
             if record["id"] != identifier or record["engine"] != name:
@@ -254,6 +304,24 @@ def main():
                     choices = row["generated_programs"]
                     raw[row["id"]] = choices[min(variant, len(choices) - 1)]
                 raw_output = args.output / f"construct-generated-{variant}.csv"
+                write_submission(raw_output, raw)
+                raw_scores = score_submission(puzzles, read_submission(raw_output))
+                summaries[name]["raw_portfolios"].append({"path": str(raw_output),
+                    "score": sum(item.instructions for item in raw_scores.values()),
+                    "sha256": digest(raw_output)})
+        if name == "lns" and args.lns_archive:
+            raw_rows = [row for row in rows if row.get("generated_programs")]
+            summaries[name]["generated_cases"] = len(raw_rows)
+            summaries[name]["archived_programs"] = sum(len(row["generated_programs"]) for row in raw_rows)
+            summaries[name]["archive_errors"] = [dict(id=row["id"], **attempt)
+                for row in rows for attempt in row["attempts"] if "archive_error" in attempt]
+            summaries[name]["raw_portfolios"] = []
+            for variant in range(max((len(row["generated_programs"]) for row in raw_rows), default=0)):
+                raw = dict(baseline)
+                for row in raw_rows:
+                    if variant < len(row["generated_programs"]):
+                        raw[row["id"]] = row["generated_programs"][variant]
+                raw_output = args.output / f"lns-generated-{variant}.csv"
                 write_submission(raw_output, raw)
                 raw_scores = score_submission(puzzles, read_submission(raw_output))
                 summaries[name]["raw_portfolios"].append({"path": str(raw_output),

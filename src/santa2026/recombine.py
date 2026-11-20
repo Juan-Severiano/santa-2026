@@ -1,6 +1,6 @@
 """Recombine several arithmetic programs with an acyclic CP-SAT value graph.
 
-Only recipes observed in supplied, validated programs are used. The model may
+By default only recipes observed in supplied, validated programs are used. The model may
 mix their derivations, but every chosen dependency must increase an integer
 topological rank. The selected graph is allocated to the real register bank
 and replayed before it can replace the shortest input program. OR-Tools is an
@@ -48,6 +48,31 @@ def _union(puzzle, programs):
                 warm[node.value] = rule
                 warm_levels[node.value] = 1 + max(warm_levels.get(left, 0), warm_levels.get(right, 0))
     return {value: sorted(choices) for value, choices in sorted(recipes.items())}, first, warm, warm_levels
+
+
+def _cross_recipes(puzzle, recipes):
+    """Connect pooled values through every legal one-operation identity.
+
+    This adds alternative edges, not free values: the model still pays for
+    every selected nonseed value and enforces an acyclic construction.
+    """
+    choices = {value: set(rules) for value, rules in recipes.items()}
+    values = sorted(set(recipes) | set(puzzle.starting_values))
+
+    def offer(result, operation, left, right):
+        if result in choices and result not in (left, right):
+            choices[result].add(_recipe(operation, left, right))
+
+    for index, left in enumerate(values):
+        for right in values[index:]:
+            offer(left + right, "+", left, right)
+            if left <= puzzle.value_limit // right:
+                offer(left * right, "*", left, right)
+            if right > left:
+                offer(right - left, "-", right, left)
+            if right % left == 0:
+                offer(right // left, "/", right, left)
+    return {value: sorted(rules) for value, rules in choices.items()}
 
 
 def _make_model(puzzle, recipes, warm, warm_levels, cp_model):
@@ -131,7 +156,7 @@ def _compile_selection(puzzle, chosen, first, levels, seed):
     return best
 
 
-def optimize_recombine(puzzle: Puzzle, programs: list[list[list]], seed=0, effort=1) -> list[list]:
+def optimize_recombine(puzzle: Puzzle, programs: list[list[list]], seed=0, effort=1, cross_recipes=False) -> list[list]:
     """Return a validated program no longer than any supplied candidate.
 
     Inputs are never modified. The compiled CP-SAT search uses one worker and
@@ -154,6 +179,8 @@ def optimize_recombine(puzzle: Puzzle, programs: list[list[list]], seed=0, effor
     except ImportError:
         return original
     recipes, first, warm, warm_levels = _union(puzzle, ordered)
+    if cross_recipes:
+        recipes = _cross_recipes(puzzle, recipes)
     model, selected, recipe_variables, ranks = _make_model(puzzle, recipes, warm, warm_levels, cp_model)
     # The input program always gives a valid upper bound. Its canonical graph
     # may be cheaper still after repeated values and dead instructions vanish.
@@ -183,3 +210,8 @@ def optimize_recombine(puzzle: Puzzle, programs: list[list[list]], seed=0, effor
         return original
     validate_program(puzzle, candidate)
     return candidate if len(candidate) < len(original) else original
+
+
+def optimize_recombine_cross(puzzle: Puzzle, programs: list[list[list]], seed=0, effort=1) -> list[list]:
+    """Recombine a Rust trajectory, including new edges between pooled values."""
+    return optimize_recombine(puzzle, programs, seed=seed, effort=effort, cross_recipes=True)

@@ -26,9 +26,34 @@ o resultado após a serialização. Os comandos são locais; não enviam submiss
 Sem `--strategy`, o solver usa `portfolio`, que compara as duas construções na mesma execução.
 Separar as rodadas permite reaproveitar o baseline e executar apenas a variação nova.
 
-## Resultados e checkpoints em 18/11/2026
+## Checkpoint de 132.543
 
-**Checkpoint atual no Kaggle: 142.272 instruções**, submissão **58523172**, aceita e pontuada.
+Em **21/11/2026**, o Kaggle confirmou **132.543 instruções**, submissão
+**58673602**, com os 1.000 programas válidos. O resultado incorpora a referência
+pública Apache-2.0 de **goodpjw2008, dataset versão 50**, com créditos em
+[THIRD_PARTY.md](THIRD_PARTY.md). É uma redução de 8.851 sobre o melhor local
+anterior de 141.394; nenhum ganho adicional do novo Rust foi demonstrado nesta base.
+
+O arquivo exato enviado está versionado em [checkpoints/132543.csv.gz](checkpoints/132543.csv.gz),
+com hashes e origem em [checkpoints/132543.json](checkpoints/132543.json).
+
+```sh
+mkdir -p outputs
+gzip -dc checkpoints/132543.csv.gz > outputs/checkpoint-132543.csv
+PYTHONPATH=src python3 -m santa2026 validate data/puzzles.csv outputs/checkpoint-132543.csv
+```
+
+O novo motor [rust/lns.rs](rust/lns.rs) reconstrói cones de alvos e intermediários,
+explora alternativas de mesmo custo e perturbações de até duas instruções,
+preservando o melhor programa. Seu alocador recompilou os 1.000 grafos da base
+sem aumentar o custo. Dois pilotos locais de 20 casos, com oito segundos por
+caso, ainda não reduziram a pontuação. O segundo guarda até oito programas
+alternativos para recombinação por CP-SAT com ordem livre e novas conexões
+entre valores observados. A meta de menos de 100.000 continua em pesquisa.
+
+## Checkpoints anteriores, 18/11/2026
+
+O checkpoint de **142.272 instruções**, submissão **58523172**, foi aceito e pontuado.
 O resultado usa a referência pública Apache-2.0 de Atakan Aldemir versão 2; nenhum ganho próprio
 adicional foi demonstrado nesta base. O CSV enviado está arquivado em `outputs/checkpoint-142272.csv`, SHA-256
 `66f6842840e7b348d7ca01c06817efd9942cda76b5aa0dc879e1db59c3b7498c`.

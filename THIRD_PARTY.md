@@ -52,3 +52,28 @@ Its owning page identifies the code as Apache 2.0, verified on 2026-11-18; pinne
 credits and license evidence remain in `data/public/research/atlas-solver/`. Downloaded foreign code
 was inspected but not executed. The constructor retains the Tony Li/konbu17 attribution for reused
 dictionary and expression primitives.
+
+On 2026-11-21, the public frontier was refreshed from **goodpjw2008**:
+
+- [LNS + CP-SAT Recombine, notebook version 50](https://www.kaggle.com/code/goodpjw2008/santa-2026-lns-cp-sat-recombine-lb-132-552?scriptVersionId=372225385),
+  132,552 instructions, CSV SHA-256 `a93780bac76cbcabe1e21cb7fbc07e884ddb4f254ed82205e688e9ba4825ab47`.
+- [DAG-LNS programs, dataset version 50](https://www.kaggle.com/datasets/goodpjw2008/santa-2026-dag-lns-programs/versions/50),
+  132,543 instructions, `our_programs.csv` SHA-256 `e453812a519ce1ed6e1471e0e6e572cf2c4a85934c57080f6b9f9a1b46943a80`.
+
+Both owning pages and the official dataset metadata specify Apache 2.0. All
+1,000 programs in each snapshot passed this repository's exact validator.
+The notebook credits Ishan Karnick, Mizero Lucky Gall, E-Max AI, Alex Chilton,
+Sargis Khachatryan, Wang Jakie, Roman Rozen, Santiago Zazo, Hanif Noer Rofiq,
+Atakan Aldemir, Hansen0223, prvsiyan, Tony Li, konbu17 and their upstream
+contributors. Full original credits, license evidence, frozen source and
+validation reports remain under the ignored `data/public/research/` snapshots.
+These frontier improvements are inherited public results, separate from any
+measured improvement produced by local Rust experiments.
+
+`rust/lns.rs` adapts the Apache-2.0 value-DAG search in goodpjw2008's
+[`elfopt.cpp`, dataset version 49](https://www.kaggle.com/datasets/goodpjw2008/santa-2026-dag-lns-programs/versions/49)
+(SHA-256 `16f12d4963acfe795f89f9632e941fb1aea9d8d8de55ac958a45b17a02881db2`)
+into Rust. That source explicitly credits prvsiyan's value-DAG neighborhood
+design. The local implementation also reuses the attributed primitives and
+allocator from `rust/repair.rs`. Downloaded foreign code was inspected and
+archived, never executed. The Rust translation retains the license and credits.

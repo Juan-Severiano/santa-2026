@@ -154,6 +154,7 @@ def _evaluate(task):
             "milp": ("milp", "optimize_milp"),
             "polish": ("beam", "polish_beam"),
             "recombine": ("recombine", "optimize_recombine"),
+            "recombinecross": ("recombine", "optimize_recombine_cross"),
             "rustjoint": ("rust_joint", "optimize_rust_joint"),
             "mitm": ("mitm", "optimize_mitm"),
         }[strategy]
@@ -162,7 +163,7 @@ def _evaluate(task):
             started = time.monotonic()
             attempt = {"strategy": strategy, "seed": seed}
             try:
-                if strategy in ("recombine", "rustjoint"):
+                if strategy in ("recombine", "recombinecross", "rustjoint"):
                     sources = [best] + [source[puzzle.id] for source in WORKER_CANDIDATES]
                     sources = [[instruction[:] for instruction in program] for program in sources]
                     candidate = function(puzzle, sources, seed=seed, effort=effort)
@@ -190,7 +191,7 @@ def main(argv=None):
     parser.add_argument("--puzzles", type=Path, required=True)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--strategies", nargs="+", choices=("shared", "synthesis", "optimize", "factor", "beam", "milp", "polish", "recombine", "rustjoint", "mitm"), required=True)
+    parser.add_argument("--strategies", nargs="+", choices=("shared", "synthesis", "optimize", "factor", "beam", "milp", "polish", "recombine", "recombinecross", "rustjoint", "mitm"), required=True)
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
     parser.add_argument("--effort", type=int, default=1)
     parser.add_argument("--jobs", type=int, help="Default: 1 for mode-6 repair; up to 8 otherwise")

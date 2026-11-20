@@ -1,0 +1,15 @@
+{
+  "score": 132543,
+  "puzzles": 1000,
+  "submission_ref": 58673602,
+  "submission_status": "COMPLETE",
+  "official_score": 132543,
+  "submitted_at_utc": "2026-11-21T14:35:22.430000Z",
+  "csv_sha256": "b2efc05c1f83450b899de7058c182192e2554a708b03a54b28e450f77d9e6efa",
+  "gzip_sha256": "604499ac2d3c92c5813586f26e95cb48a8136ad2364ae58e480d80369b86ee4c",
+  "puzzles_sha256": "b0c70d849eca078a0e1cf9a4f7b47fd40b7435663f6f84de6725f84724500428",
+  "public_source": "https://www.kaggle.com/datasets/goodpjw2008/santa-2026-dag-lns-programs/versions/50",
+  "source_csv_sha256": "e453812a519ce1ed6e1471e0e6e572cf2c4a85934c57080f6b9f9a1b46943a80",
+  "license": "Apache-2.0",
+  "local_rust_savings_on_this_reference": 0
+}

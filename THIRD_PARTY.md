@@ -77,3 +77,19 @@ into Rust. That source explicitly credits prvsiyan's value-DAG neighborhood
 design. The local implementation also reuses the attributed primitives and
 allocator from `rust/repair.rs`. Downloaded foreign code was inspected and
 archived, never executed. The Rust translation retains the license and credits.
+
+The 2026-11-21 research refresh also inspected the Apache-2.0
+[Goodpjw dataset version 55](https://www.kaggle.com/datasets/goodpjw2008/santa-2026-dag-lns-programs/versions/55).
+Its 1,000 programs replay with 132,516 instructions; the source CSV SHA-256 is
+`6b1b73875bab6a73aa676b6808f8a3e90076662c88e529ff000b1a4ab0cf6688`.
+Merging it with the existing local one-instruction Rust improvement gives
+132,515. That additional public-reference saving is not attributed to the new
+Rust research. Frozen license evidence, original attributions and validation
+are under `data/public/research/reference-goodpjw-dataset-v55/`.
+
+The experimental atomic frontier reconstruction in `rust/lns.rs` is developed
+locally using the existing search primitives. Its shared-cost rationale is
+informed by the primary papers cited in `docs/research/`, and by Atakan
+Aldemir's credited interface/block-reconstruction work inspected through the
+Apache-2.0 source snapshots. Published gains on older public baselines are
+reported as upstream measurements, not local results.

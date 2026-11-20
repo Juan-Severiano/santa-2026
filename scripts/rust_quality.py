@@ -200,14 +200,14 @@ def main():
     parser.add_argument("--tail-boundary", action="store_true")
     parser.add_argument("--groups-direct", action="store_true", help="Resynthesize one complete private cone from safe outside context")
     parser.add_argument("--window-rename", action="store_true", help="Match physical live-outs up to a bijective suffix register renaming")
-    parser.add_argument("--lns-flags", type=int, default=15, help="LNS feature bits: 1 helper roots, 2 plateau moves, 4 depth-five near misses, 8 kicks")
+    parser.add_argument("--lns-flags", type=int, default=15, help="LNS feature bits: 1 helper roots, 2 plateau moves, 4 depth-five near misses, 8 kicks, 16 atomic frontier reconstruction")
     parser.add_argument("--lns-seed", type=int, default=0)
     parser.add_argument("--lns-archive", action="store_true", help="Keep up to eight replay-valid LNS trajectory programs per puzzle")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.seconds <= 0:
         parser.error("seconds must be positive")
-    if len(set(args.methods)) != len(args.methods) or args.joint_helpers < 0 or not 0 <= args.joint_plans <= 256 or not 0 <= args.lns_flags <= 15 or not 0 <= args.lns_seed < 2**64 - 64:
+    if len(set(args.methods)) != len(args.methods) or args.joint_helpers < 0 or not 0 <= args.joint_plans <= 256 or not 0 <= args.lns_flags <= 31 or not 0 <= args.lns_seed < 2**64 - 64:
         parser.error("methods must be unique and helper budget nonnegative")
     puzzles = read_puzzles(args.puzzles)
     by_id = {p.id: p for p in puzzles}

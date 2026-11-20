@@ -26,7 +26,36 @@ o resultado após a serialização. Os comandos são locais; não enviam submiss
 Sem `--strategy`, o solver usa `portfolio`, que compara as duas construções na mesma execução.
 Separar as rodadas permite reaproveitar o baseline e executar apenas a variação nova.
 
-## Checkpoint de 132.543
+## Checkpoint oficial de 132.515
+
+Em **21/11/2026**, o Kaggle confirmou **132.515 instruções**, submissão
+**58675401**. O resultado combina a referência pública Apache-2.0 de
+goodpjw2008, dataset versão 55 (132.516), com a instrução de economia já
+produzida pelo Rust em `scored_0757`. As 27 instruções adicionais frente ao
+checkpoint anterior são herdadas da atualização pública.
+
+Arquivo exato: [checkpoints/132515.csv.gz](checkpoints/132515.csv.gz).
+Hashes, origem e atribuição: [checkpoints/132515.json](checkpoints/132515.json)
+e [aviso original](checkpoints/132515-NOTICE.md).
+
+## Checkpoint de 132.542
+
+Em **21/11/2026**, o Kaggle confirmou **132.542 instruções**, submissão
+**58674486**. O Rust LNS reduziu `scored_0757` de 129 para 128 instruções sobre
+a referência pública de 132.543. O lote privado usou 100 puzzles, quatro CPUs
+e nenhum acelerador. Os 1.000 programas do CSV final passaram no replay local.
+A recombinação posterior de 656 alternativas não trouxe ganho adicional.
+
+O CSV exato enviado está em [checkpoints/132542.csv.gz](checkpoints/132542.csv.gz),
+com hashes, origem e autoria do ganho em [checkpoints/132542.json](checkpoints/132542.json).
+
+```sh
+mkdir -p outputs
+gzip -dc checkpoints/132542.csv.gz > outputs/checkpoint-132542.csv
+PYTHONPATH=src python3 -m santa2026 validate data/puzzles.csv outputs/checkpoint-132542.csv
+```
+
+## Referência pública de 132.543
 
 Em **21/11/2026**, o Kaggle confirmou **132.543 instruções**, submissão
 **58673602**, com os 1.000 programas válidos. O resultado incorpora a referência
@@ -50,6 +79,30 @@ sem aumentar o custo. Dois pilotos locais de 20 casos, com oito segundos por
 caso, ainda não reduziram a pontuação. O segundo guarda até oito programas
 alternativos para recombinação por CP-SAT com ordem livre e novas conexões
 entre valores observados. A meta de menos de 100.000 continua em pesquisa.
+
+## Pesquisa matemática e novas vizinhanças
+
+O levantamento de 21/11 reúne fontes primárias, custos reais e resultados
+negativos em três notas: [circuitos multi-output](docs/research/2026-11-21-multioutput-circuits.md),
+[relações inteiras](docs/research/2026-11-21-integer-relations.md) e
+[métodos públicos](docs/research/2026-11-21-public-methods.md).
+
+O novo modo experimental do Rust reconstrói um corte inteiro do grafo e
+compartilha os valores novos entre as saídas. Isso permite eliminar uma conta
+antiga depois de substituir todos os seus consumidores, mesmo quando nenhuma
+troca isolada economiza instruções. Também amostra blocos de 3–8 alvos reais;
+um exemplo sintético passou de nove para oito operações, com replay independente.
+Os pilotos iniciais de 20 casos e de 40 casos com
+maior custo privado não demonstraram redução sobre a base congelada de 132.542.
+Esses resultados não provam ótimo global nem inviabilidade de outras construções.
+O piloto posterior com blocos de alvos amostrou 640 grupos e testou 2.380
+ordens em 20 casos, também sem redução competitiva.
+
+Uma atualização separada da referência pública Goodpjw, dataset versão 55,
+replaya em 132.516. Preservando a melhoria Rust de `scored_0757`, o melhor
+portfólio local chegou a **132.515**. Esse ganho de 27 sobre o checkpoint oficial
+anterior vem da nova referência pública; o ganho próprio preservado continua sendo uma
+instrução. A atualização não é resultado dos novos pilotos matemáticos.
 
 ## Checkpoints anteriores, 18/11/2026
 

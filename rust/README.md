@@ -130,7 +130,8 @@ outputs/bin/lns-tests
 
 Arguments: `seed milliseconds flags`, defaults `0 2000 15`. The budget is
 1–600,000 milliseconds. Feature bits are 1 for helper roots, 2 for equal-cost
-moves, 4 for depth-five products, and 8 for perturbations. It uses the existing
+moves, 4 for depth-five products, 8 for perturbations, and 16 for atomic
+multi-output frontier reconstruction. It uses the existing
 single-hint input and one-line `id JSON-program` output protocol. Search checks
 a soft deadline; the Python controller enforces the outer wall-time limit.
 
@@ -144,3 +145,26 @@ their scores are reported separately from best-score improvements.
 observed values, adds legal arithmetic edges, and enforces acyclic selection
 with optional OR-Tools CP-SAT. The search itself remains Rust; Python handles
 orchestration, model assembly and independent exact validation.
+
+With bit16, a cut replaces all 2–12 direct consumers of a non-target helper,
+or a sampled block of 3, 4, 6 or 8 actual targets. At most 32 target blocks are
+sampled per puzzle from original completion order and a shuffled order. Each
+cut tries four construction orders, exposing each newly paid intermediate to
+later outputs. Two orders skip the original root recipe to explore other
+equal-cost derivations. The replacement is accepted atomically after the full
+DAG is scheduled and replayed. Removed nodes and all descendants of the output
+ports are excluded from the initial context, preventing free dependencies and
+cycles. A target-block phase receives a separate share of the budget.
+
+`flags=16` runs only this frontier search with up to three operations per port.
+`flags=20` also allows up to five operations for helper-consumer cuts; target
+blocks retain the three-operation cap. `flags=31` spends up to a third of the
+budget on frontier reconstruction before the original walk. Flags0–15 retain
+their previous behavior. These are bounded greedy searches: first recipes,
+sampled blocks and deadlines can miss useful combinations.
+
+An independent Python replay confirms a synthetic three-target example drops
+from nine operations to eight through shared new intermediates. The earlier
+helper-cut pilots found no gain on 20 cost-stratified cases or 40 cases ranked
+by removable private cost. Research notes distinguish this synthetic mechanism
+from demonstrated competitive savings.

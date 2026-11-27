@@ -93,3 +93,21 @@ informed by the primary papers cited in `docs/research/`, and by Atakan
 Aldemir's credited interface/block-reconstruction work inspected through the
 Apache-2.0 source snapshots. Published gains on older public baselines are
 reported as upstream measurements, not local results.
+
+## External engines used on 2026-11-25 and 2026-11-26 (not vendored)
+
+The local passes and the private Kaggle search job run unmodified files taken from downloaded datasets
+under the ignored `data/public/` directory. `scripts/kaggle_search.py` copies them into a private Kaggle
+dataset; none of them is committed here.
+
+- **goodpjw2008**, [Santa 2026 DAG-LNS programs](https://www.kaggle.com/datasets/goodpjw2008/santa-2026-dag-lns-programs)
+  (dataset metadata: Apache 2.0): `triwalk.cpp`, `tri_driver.py`, `elf.py`, `pfmt.py`, `gpu_lns.py`.
+- **Ross Wade**, [Santa 2026 Elf Calculator Proved](https://www.kaggle.com/datasets/rosswade/santa-2026-elf-calculator-proved)
+  (dataset metadata: CC0 1.0): `lns_gpu.py`, `gpu_mitm2.py`.
+
+Submission 58973493 (127,479 instructions) is an exact-replay merge of public program banks, mostly
+**Alex Chilton**'s [Rudolph programs](https://www.kaggle.com/datasets/alexchilton/santa-2026-rudolph-programs)
+(CC0 1.0), itself a best-of-public merge crediting many authors, on top of an earlier public portfolio that
+includes the `kindasomethin/santa-2026-exact-portfolio-checkpoints` aggregate (license "other"). Local
+triwalk runs shortened six puzzles relative to every bank downloaded at that time. That CSV is not
+versioned here.

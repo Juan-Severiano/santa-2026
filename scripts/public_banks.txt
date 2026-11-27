@@ -1,0 +1,19 @@
+# Public Kaggle program banks read by update_frontier.py (data only, replayed exactly).
+# Licenses are re-read on every run and recorded in outputs/frontier/<run>/report.json.
+alexchilton/santa-2026-rudolph-programs
+goodpjw2008/santa-2026-dag-lns-programs
+ishankarnick/santa-2026-frontier-programs
+asteriospanoras/santa-2026-elf-programs-and-experiments
+b05204047elias/santa-2026-bounds-triage-programs
+b05204047elias/elf-calculator-verified-best-programs
+b05204047elias/santa-2026-basin-lineage-programs
+viktorbarbarich/santa-2026-value-graph-lns-programs
+evgendvorkin/santa-2026-arithmetic-program-atlas
+farshidamira/opprime-dataset
+farshidamira/santa-2026-share
+hillsidecollective/santa-2026-elf-r27-frontier
+tamerlanomralinov/santa-2026-frontier-programs-tamerlan
+rosswade/santa-2026-elf-calculator-proved
+ozertuu/santa-2026-verified-programs
+royalacecat/santa-2026-verified-frontier-128070
+kindasomethin/santa-2026-exact-portfolio-checkpoints

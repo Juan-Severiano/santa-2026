@@ -26,6 +26,55 @@ o resultado após a serialização. Os comandos são locais; não enviam submiss
 Sem `--strategy`, o solver usa `portfolio`, que compara as duas construções na mesma execução.
 Separar as rodadas permite reaproveitar o baseline e executar apenas a variação nova.
 
+## Atualizar a partir dos bancos públicos
+
+A fronteira pública da competição muda várias vezes por dia. Com o CLI do Kaggle autenticado, um comando
+baixa os bancos listados em [scripts/public_banks.txt](scripts/public_banks.txt), reexecuta cada programa e
+fica com o menor válido por puzzle. Ele **não envia nada** ao Kaggle.
+
+```sh
+cp caminho/do/melhor-envio.csv outputs/best.csv   # só na primeira vez
+python3 scripts/update_frontier.py --kaggle caminho/do/kaggle
+```
+
+Cada rodada grava em `outputs/frontier/<data-hora>/` o candidato, a lista de puzzles que mudaram e um
+relatório com a licença de cada banco e o arquivo que forneceu cada programa. `outputs/best.csv` só é
+substituído quando a nota cai. Ganhos vindos desses bancos são de seus autores, não deste repositório;
+para versionar um checkpoint, use apenas bancos com licença conhecida e registre a atribuição em
+[THIRD_PARTY.md](THIRD_PARTY.md). `scripts/merge_banks.py` faz só a mesclagem, a partir de pastas já baixadas.
+
+## Busca em sessões privadas do Kaggle
+
+`scripts/kaggle_search.py` prepara um dataset e kernels **privados, sem internet**: sessões de CPU rodam o
+recozimento triwalk (goodpjw2008, Apache-2.0), cada uma num pedaço dos puzzles; a sessão de GPU roda também
+o reparo exato de Ross Wade (CC0). O script só monta as pastas e imprime os comandos de envio.
+
+```sh
+python3 scripts/collect_lineages.py --output outputs/lineages.jsonl data/public/research
+python3 scripts/kaggle_search.py --owner USUARIO --lineages outputs/lineages.jsonl \
+  --goodpjw pasta/do/dataset-goodpjw --rosswade pasta/do/dataset-rosswade
+```
+
+Para acompanhar um passe local do triwalk, `python3 scripts/watch_search.py PASTA_DO_PASSE` mostra um
+puzzle por linha, o ganho acumulado e o tempo estimado, sem alterar a busca.
+
+Durante a execução, os logs ficam na página de cada kernel no Kaggle. As saídas só existem quando a sessão
+termina. Para coletar, baixe cada uma numa pasta nova e mescle com replay exato:
+
+```sh
+kaggle kernels output USUARIO/santa-search-cpu-0 -p outputs/kaggle-results/cpu-0
+python3 scripts/merge_banks.py --puzzles data/puzzles.csv --start outputs/best.csv \
+  --output outputs/kaggle-results/candidate.csv outputs/kaggle-results
+```
+
+## Envio de 127.479, 26/11/2026
+
+O Kaggle confirmou **127.479 instruções** na submissão **58973493**, igual ao replay local dos 1.000
+programas (SHA-256 do CSV `2b45eb6013478ab8312febd7842a8b2616c971bf7faf1f94545f698cdf453001`). Quase toda a
+queda desde 132.515 vem de bancos públicos de outros autores. Frente a todos os bancos baixados naquele
+momento, rodadas locais do triwalk encurtaram **6 puzzles em 1 instrução cada**. O CSV não está versionado;
+as origens estão em [THIRD_PARTY.md](THIRD_PARTY.md). A meta de menos de 100.000 continua em aberto.
+
 ## Checkpoint oficial de 132.515
 
 Em **21/11/2026**, o Kaggle confirmou **132.515 instruções**, submissão

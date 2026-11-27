@@ -21,7 +21,8 @@ def optimize_rust_lns(puzzle: Puzzle, program, seed=0, effort=1):
     """Search a continuous trajectory and keep a validated, nonregressing result.
 
     Feature bits: helper-root neighborhoods=1, equal-cost moves=2, depth-five
-    near-miss products=4, bounded perturbations=8, atomic frontier repair=16.
+    near-miss products=4, bounded perturbations=8, atomic frontier repair=16,
+    paid original completion=32, related target groups=64, ranked plans=128.
     Flags16 alone searches multi-output cuts without the single-root walk.
     The native engine keeps its
     best program separately from the potentially longer current trajectory.
@@ -35,8 +36,8 @@ def optimize_rust_lns(puzzle: Puzzle, program, seed=0, effort=1):
         raise ValueError("The native LNS requires 48 registers")
     milliseconds = int(os.environ.get("SANTA2026_LNS_MS", str(min(120_000, 15_000 * effort))))
     flags = int(os.environ.get("SANTA2026_LNS_FLAGS", "15"))
-    if not 1 <= milliseconds <= 600_000 or not 0 <= flags <= 31:
-        raise ValueError("LNS requires 1..600000 milliseconds and feature bits 0..31")
+    if not 1 <= milliseconds <= 600_000 or not 0 <= flags <= 255:
+        raise ValueError("LNS requires 1..600000 milliseconds and feature bits 0..255")
     fields = ["puzzle", puzzle.value_limit, len(puzzle.starting_values), len(puzzle.targets),
               *puzzle.starting_values, *puzzle.targets, len(program)]
     for instruction in program:

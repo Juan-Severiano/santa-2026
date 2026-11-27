@@ -6,7 +6,10 @@
 // and physical allocation reuse repair.rs, by Tony Li and konbu17.
 // See THIRD_PARTY.md and licenses/Apache-2.0.txt.
 // CLI: seed milliseconds flags. Bits: 1 helpers, 2 plateau, 4 depth5, 8 kicks,
-// 16 atomic multi-output frontier reconstruction (16 alone disables the walk).
+// 16 atomic multi-output frontier reconstruction (16 alone disables the walk),
+// 32 paid original-recipe completion inside frontier reconstruction only.
+// 64 select part of the target blocks through shared dependency support.
+// 128 rank alternative short plans inside paid frontier completion.
 // Input/output: the same single-hint token protocol as repair.rs.
 
 #[allow(dead_code)]
@@ -14,6 +17,8 @@ mod engine {
     include!("repair.rs");
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+    include!("target_groups.rs");
+    include!("plan_frontier.rs");
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct Step { op: u8, a: Int, b: Int, value: Int }
@@ -63,6 +68,11 @@ mod engine {
         max_s1: usize, need_aborts: usize, deadline_aborts: usize, skipped_identity: usize,
         frontier_cuts: usize, frontier_orders: usize, frontier_ports: usize, frontier_wins: usize,
         target_blocks: usize, target_block_orders: usize, target_block_wins: usize,
+        warm_ports: usize, warm_steps: usize, warm_complete_frontiers: usize,
+        warm_nonimproving: usize, warm_compile_rejects: usize, warm_fail_budget: usize,
+        warm_invalid_original: usize,
+        related_blocks: usize, related_orders: usize, related_wins: usize,
+        plan_queries: usize, plan_candidates: usize, plan_catalogs: usize,
     }
 
     struct Searcher {
@@ -426,6 +436,113 @@ mod engine {
         Some((trial,program))
     }
 
+    #[derive(Debug,Eq,PartialEq)]
+    enum WarmFailure { Deadline, Cycle, Budget, InvalidRecipe }
+
+    // Materialize the original recipe down to the actually paid prefix. A
+    // retained-but-blocked value is charged too; it is never a free leaf.
+    // Iterative postorder avoids recursive call-stack growth on long hints.
+    fn paid_original(puzzle:&Puzzle,target:Int,built:&mut HashSet<Int>,available:&mut Vec<Int>,
+                     steps:&mut Vec<Step>,maximum:usize,deadline:Instant)->Result<usize,WarmFailure> {
+        let maximum=maximum.min(4096); let before=steps.len();
+        let mut stack=vec![(target,false)]; let mut visiting=HashSet::new(); let mut expanded=0usize;
+        while let Some((value,leaving))=stack.pop() {
+            if Instant::now()>=deadline { return Err(WarmFailure::Deadline); }
+            if built.contains(&value) { continue; }
+            let &(a,b)=puzzle.arguments.get(&value).ok_or(WarmFailure::InvalidRecipe)?;
+            let op=puzzle.definitions.get(&value).ok_or(WarmFailure::InvalidRecipe)?.op;
+            if checked(op,a,b,puzzle.limit)!=Some(value) { return Err(WarmFailure::InvalidRecipe); }
+            if leaving {
+                if !built.contains(&a) || !built.contains(&b) { return Err(WarmFailure::InvalidRecipe); }
+                if steps.len()>=maximum { return Err(WarmFailure::Budget); }
+                visiting.remove(&value); built.insert(value); available.push(value);
+                steps.push(Step{op,a,b,value});
+            } else {
+                if !visiting.insert(value) { return Err(WarmFailure::Cycle); }
+                expanded+=1; if expanded>4096 { return Err(WarmFailure::Budget); }
+                stack.push((value,true)); stack.push((b,false)); stack.push((a,false));
+            }
+        }
+        Ok(steps.len()-before)
+    }
+
+    fn rebuild_frontier_warm(puzzle:&Puzzle,roots:&[Int],removed:&BTreeSet<Int>,pool:&[Int],
+                             deadline:Instant,generator:&mut Mt19937_64,metrics:&mut Metrics,
+                             depth:usize,filter_identity:bool)->Option<(Puzzle,Program)> {
+        rebuild_frontier_with_plans(puzzle,roots,removed,pool,deadline,generator,metrics,depth,filter_identity,false)
+    }
+
+    fn rebuild_frontier_with_plans(puzzle:&Puzzle,roots:&[Int],removed:&BTreeSet<Int>,pool:&[Int],
+                             deadline:Instant,generator:&mut Mt19937_64,metrics:&mut Metrics,
+                             depth:usize,filter_identity:bool,rank_plans:bool)->Option<(Puzzle,Program)> {
+        let mut pending=roots.to_vec(); generator.shuffle(&mut pending);
+        let mut available=pool.to_vec(); generator.shuffle(&mut available);
+        let mut built:HashSet<Int>=available.iter().copied().collect(); let mut steps=Vec::new();
+        let maximum=removed.len().saturating_add(2).min(4096);
+        while let Some(target)=pending.pop() {
+            if Instant::now()>=deadline { return None; }
+            if built.contains(&target) { continue; }
+            if steps.len()>=maximum { metrics.warm_fail_budget+=1; return None; }
+            // Keep the cold search's strict improvement budget. When it cannot
+            // finish a port, pay the original path under the larger total cap.
+            let budget=removed.len().checked_sub(steps.len()+1).unwrap_or(0);
+            let mut plan=None;
+            if budget>0 {
+                let mut search=Searcher::new(available.clone(),puzzle.limit,deadline)?;
+                if filter_identity {
+                    search.root=target;
+                    let mut needed=BTreeSet::new(); let mut old_pending=vec![target];
+                    while let Some(value)=old_pending.pop() {
+                        if Instant::now()>=deadline { return None; }
+                        if built.contains(&value) || !needed.insert(value) { continue; }
+                        let &(mut a,mut b)=puzzle.arguments.get(&value)?;
+                        let op=puzzle.definitions.get(&value)?.op;
+                        old_pending.push(a); old_pending.push(b);
+                        if (op==b'+' || op==b'*') && a>b { std::mem::swap(&mut a,&mut b); }
+                        search.identity.push((value,op,a,b));
+                    }
+                    search.identity.sort_unstable();
+                }
+                metrics.catalogs+=1; metrics.max_pool=metrics.max_pool.max(search.pool.len());
+                metrics.max_s1=metrics.max_s1.max(search.one.len());
+                if rank_plans {
+                    let choice=choose_frontier_plan(&mut search,target,&pending,budget.min(depth),deadline);
+                    metrics.plan_queries+=1; metrics.plan_candidates+=choice.plans;
+                    metrics.plan_catalogs+=choice.catalogs;
+                    plan=choice.plan;
+                    if plan.is_none() && depth>3 && Instant::now()<deadline {
+                        plan=search.find(target,budget.min(depth),true,metrics);
+                    }
+                } else {
+                    plan=search.find(target,budget.min(depth),depth>=5,metrics);
+                }
+                metrics.skipped_identity+=search.skipped_identity;
+            }
+            if let Some(plan)=plan {
+                for step in plan {
+                    if built.insert(step.value) { available.push(step.value); steps.push(step); }
+                }
+            } else {
+                metrics.warm_ports+=1;
+                match paid_original(puzzle,target,&mut built,&mut available,&mut steps,maximum,deadline) {
+                    Ok(count)=>metrics.warm_steps+=count,
+                    Err(WarmFailure::Budget)=>{metrics.warm_fail_budget+=1; return None;},
+                    Err(WarmFailure::Deadline)=>return None,
+                    Err(_)=>{metrics.warm_invalid_original+=1; return None;},
+                }
+            }
+        }
+        if !roots.iter().all(|root|built.contains(root)) { return None; }
+        let trial=match rebuild(puzzle,removed,*roots.last()?,&steps) {
+            Ok(trial)=>trial, Err(_)=>{metrics.warm_compile_rejects+=1; return None;},
+        };
+        let program=match verified_program(&trial) {
+            Ok(program)=>program, Err(_)=>{metrics.warm_compile_rejects+=1; return None;},
+        };
+        metrics.warm_complete_frontiers+=1;
+        Some((trial,program))
+    }
+
     const MAX_TARGET_BLOCKS: usize=32;
 
     fn sampled_target_blocks(puzzle:&Puzzle,generator:&mut Mt19937_64,maximum:usize)->Vec<Vec<Int>> {
@@ -454,22 +571,40 @@ mod engine {
     type FrontierCandidate=(usize,Int,Vec<Int>,BTreeSet<Int>,Vec<Int>);
 
     fn try_frontiers(walk:&mut Walk,mut candidates:Vec<FrontierCandidate>,deadline:Instant,
-                     generator:&mut Mt19937_64,metrics:&mut Metrics,depth:usize,target_blocks:bool)
+                     generator:&mut Mt19937_64,metrics:&mut Metrics,depth:usize,target_blocks:bool,warm:bool,rank_plans:bool)
                      ->Outcome<bool> {
         generator.shuffle(&mut candidates);
-        candidates.sort_by_key(|candidate|std::cmp::Reverse(candidate.0));
-        for (_,_,ports,removed,pool) in candidates {
+        if candidates.iter().any(|candidate|candidate.1 == -1) {
+            candidates.sort_by_key(|candidate|(candidate.1 != -1,std::cmp::Reverse(candidate.0)));
+        } else {
+            candidates.sort_by_key(|candidate|std::cmp::Reverse(candidate.0));
+        }
+        for (_,source,ports,removed,pool) in candidates {
             if Instant::now()>=deadline { break; }
             metrics.frontier_cuts+=1; metrics.frontier_ports=metrics.frontier_ports.max(ports.len());
             for variant in 0..4 {
                 if Instant::now()>=deadline { break; }
                 metrics.frontier_orders+=1;
                 if target_blocks { metrics.target_block_orders+=1; }
-                if let Some((trial,program))=rebuild_frontier(&walk.current,&ports,&removed,&pool,
-                    deadline,generator,metrics,depth,variant%2==1) {
+                if source == -1 { metrics.related_orders+=1; }
+                let result=if warm {
+                    if rank_plans {
+                        rebuild_frontier_with_plans(&walk.current,&ports,&removed,&pool,deadline,generator,metrics,depth,variant%2==1,true)
+                    } else {
+                        rebuild_frontier_warm(&walk.current,&ports,&removed,&pool,deadline,generator,metrics,depth,variant%2==1)
+                    }
+                } else {
+                    rebuild_frontier(&walk.current,&ports,&removed,&pool,deadline,generator,metrics,depth,variant%2==1)
+                };
+                if let Some((trial,program))=result {
+                    if warm && program.len()>=walk.current_cost { metrics.warm_nonimproving+=1; }
+                    // A valid neutral joint circuit may contribute recipes to
+                    // later global extraction without moving the strict walk.
+                    walk.record_frontier_trial(&trial,&program);
                     if walk.accept(trial,program,false,false,metrics) {
                         metrics.frontier_wins+=1;
                         if target_blocks { metrics.target_block_wins+=1; }
+                        if source == -1 { metrics.related_wins+=1; }
                         return Ok(true);
                     }
                 }
@@ -479,7 +614,7 @@ mod engine {
     }
 
     fn frontier_pass(walk: &mut Walk, deadline: Instant, generator: &mut Mt19937_64,
-                     metrics: &mut Metrics, depth: usize) -> Outcome<bool> {
+                     metrics: &mut Metrics, depth: usize, warm:bool, related:bool,rank_plans:bool) -> Outcome<bool> {
         let mut users:BTreeMap<Int,BTreeSet<Int>>=BTreeMap::new();
         for (&value,&(a,b)) in &walk.current.arguments {
             users.entry(a).or_default().insert(value); users.entry(b).or_default().insert(value);
@@ -498,14 +633,32 @@ mod engine {
             candidates.push((removed.len()-ports.len(),pivot,ports,removed,pool));
         }
         let remaining=MAX_TARGET_BLOCKS.saturating_sub(metrics.target_blocks);
-        let blocks=sampled_target_blocks(&walk.current,generator,remaining);
+        let blocks:Vec<(Vec<Int>,bool)>=if related {
+            let mut chosen:Vec<(Vec<Int>,bool)>=related_target_blocks(&walk.current,(remaining/2).min(16))?
+                .into_iter().map(|group|(group,true)).collect();
+            let mut seen:BTreeSet<Vec<Int>>=chosen.iter().map(|(group,_)|group.clone()).collect();
+            let ordinary=sampled_target_blocks(&walk.current,generator,remaining);
+            // Mix both halves before filling the remaining slots, rather than
+            // retaining only the completion-order prefix of the old sample.
+            for position in 0..ordinary.len() {
+                if chosen.len()>=remaining { break; }
+                let index=if position%2==0 {position/2}else{ordinary.len().div_ceil(2)+position/2};
+                let group=ordinary[index].clone();
+                let mut key=group.clone(); key.sort_unstable();
+                if seen.insert(key) { chosen.push((group,false)); }
+            }
+            chosen
+        } else {
+            sampled_target_blocks(&walk.current,generator,remaining).into_iter().map(|group|(group,false)).collect()
+        };
         metrics.target_blocks+=blocks.len();
         let mut block_candidates=Vec::new();
-        for ports in blocks {
+        for (ports,is_related) in blocks {
             if Instant::now()>=deadline { break; }
             let (removed,pool)=frontier_context(&walk.current,&ports)?;
             if removed.len()>ports.len() {
-                block_candidates.push((removed.len()-ports.len(),0,ports,removed,pool));
+                if is_related { metrics.related_blocks+=1; }
+                block_candidates.push((removed.len()-ports.len(),if is_related {-1}else{0},ports,removed,pool));
             }
         }
         // Reserve a separate half-budget for actual-target groups so a large
@@ -513,10 +666,10 @@ mod engine {
         let now=Instant::now();
         let block_deadline=if candidates.is_empty() { deadline }
             else { now+deadline.saturating_duration_since(now)/2 };
-        if try_frontiers(walk,block_candidates,block_deadline,generator,metrics,depth.min(3),true)? {
+        if try_frontiers(walk,block_candidates,block_deadline,generator,metrics,depth.min(3),true,warm,rank_plans)? {
             return Ok(true);
         }
-        try_frontiers(walk,candidates,deadline,generator,metrics,depth,false)
+        try_frontiers(walk,candidates,deadline,generator,metrics,depth,false,warm,rank_plans)
     }
 
     fn rebuild(puzzle: &Puzzle, removed: &BTreeSet<Int>, root: Int, steps: &[Step]) -> Outcome<Puzzle> {
@@ -636,6 +789,10 @@ mod engine {
     }
 
     impl Walk {
+        fn record_frontier_trial(&mut self,puzzle:&Puzzle,program:&Program) {
+            if let Some(archive)=&mut self.archive { archive.consider(puzzle,program,self.best.len()); }
+        }
+
         fn accept(&mut self, trial: Puzzle, program: Program, plateau: bool, kick: bool, metrics: &mut Metrics) -> bool {
             let cost = program.len();
             let limit = if kick { self.best.len().saturating_add(2) } else { self.current_cost };
@@ -667,7 +824,8 @@ mod engine {
             let frontier_deadline=if !walk_enabled { deadline }
                 else { (Instant::now()+Duration::from_millis(milliseconds/3)).min(deadline) };
             while Instant::now()<frontier_deadline {
-                if !frontier_pass(&mut walk,frontier_deadline,&mut generator,&mut metrics,if flags&4!=0 {5}else{3})? { break; }
+                if !frontier_pass(&mut walk,frontier_deadline,&mut generator,&mut metrics,
+                    if flags&4!=0 {5}else{3},flags&32!=0,flags&64!=0,flags&128!=0)? { break; }
             }
         }
         while walk_enabled && Instant::now()<deadline {
@@ -778,7 +936,7 @@ mod engine {
         let seed:u64=args.get(1).map_or(Ok(0),|s|s.parse().map_err(|_|"invalid seed"))?;
         let milliseconds:u64=args.get(2).map_or(Ok(2000),|s|s.parse().map_err(|_|"invalid milliseconds"))?;
         let flags:u8=args.get(3).map_or(Ok(15),|s|s.parse().map_err(|_|"invalid flags"))?;
-        if milliseconds==0 || milliseconds>600_000 || flags>31 { return Err("invalid LNS budget".into()); }
+        if milliseconds==0 || milliseconds>600_000 { return Err("invalid LNS budget".into()); }
         let stdin=io::stdin(); let mut scanner=Scanner::new(BufReader::new(stdin.lock()));
         let stdout=io::stdout(); let mut writer=BufWriter::new(stdout.lock());
         while let Some(id)=scanner.next()? {
@@ -808,6 +966,19 @@ mod engine {
             writeln!(writer,"]").map_err(|e|e.to_string())?; writer.flush().map_err(|e|e.to_string())?;
             eprintln!("{{\"lns\":\"{}\",\"baseline\":{},\"best\":{},\"attempts\":{},\"helper_attempts\":{},\"accepted\":{},\"plateaus\":{},\"kicks\":{},\"improvements\":{},\"catalogs\":{},\"max_pool\":{},\"max_s1\":{},\"need_aborts\":{},\"deadline_aborts\":{},\"skipped_identity\":{},\"frontier_cuts\":{},\"frontier_orders\":{},\"frontier_max_ports\":{},\"frontier_wins\":{},\"target_blocks\":{},\"target_block_orders\":{},\"target_block_wins\":{}}}",
                 id,hint.len(),program.len(),m.attempts,m.helper_attempts,m.accepted,m.plateaus,m.kicks,m.improvements,m.catalogs,m.max_pool,m.max_s1,m.need_aborts,m.deadline_aborts,m.skipped_identity,m.frontier_cuts,m.frontier_orders,m.frontier_ports,m.frontier_wins,m.target_blocks,m.target_block_orders,m.target_block_wins);
+            if flags&48==48 {
+                eprintln!("{{\"lns_warm\":\"{}\",\"warm_ports\":{},\"warm_steps\":{},\"warm_complete_frontiers\":{},\"warm_nonimproving\":{},\"warm_compile_rejects\":{},\"warm_fail_budget\":{},\"warm_invalid_original\":{}}}",
+                    id,m.warm_ports,m.warm_steps,m.warm_complete_frontiers,m.warm_nonimproving,
+                    m.warm_compile_rejects,m.warm_fail_budget,m.warm_invalid_original);
+            }
+            if flags&80==80 {
+                eprintln!("{{\"lns_related\":\"{}\",\"related_blocks\":{},\"related_orders\":{},\"related_wins\":{}}}",
+                    id,m.related_blocks,m.related_orders,m.related_wins);
+            }
+            if flags&176==176 {
+                eprintln!("{{\"lns_plans\":\"{}\",\"plan_queries\":{},\"plan_candidates\":{},\"plan_catalogs\":{}}}",
+                    id,m.plan_queries,m.plan_candidates,m.plan_catalogs);
+            }
         }
         Ok(())
     }
@@ -1014,6 +1185,99 @@ mod engine {
             let (program,metrics)=optimize(p.clone(),&hint,0,1,16).unwrap();
             assert!(program.len()<=hint.len()); assert_eq!(metrics.attempts,0);
             let mut replay=p; replay.load_hint(&program).unwrap();
+        }
+
+        #[test]
+        fn paid_original_counts_shared_nodes_once_and_never_treats_blocked_values_as_free() {
+            let mut p=puzzle(vec![2,5],vec![14,35],100);
+            p.make(b'+',2,5).unwrap(); p.make(b'*',2,7).unwrap(); p.make(b'*',5,7).unwrap();
+            let mut built=HashSet::from([2,5]); let mut available=vec![2,5]; let mut steps=Vec::new();
+            let deadline=Instant::now()+Duration::from_secs(1);
+            assert_eq!(paid_original(&p,14,&mut built,&mut available,&mut steps,5,deadline),Ok(2));
+            assert_eq!(paid_original(&p,35,&mut built,&mut available,&mut steps,5,deadline),Ok(1));
+            assert_eq!(steps.len(),3); assert_eq!(steps.iter().filter(|step|step.value==7).count(),1);
+            assert_eq!(available.iter().filter(|&&value|value==7).count(),1);
+        }
+
+        #[test]
+        fn paid_original_rejects_cycles_inexact_or_out_of_limit_recipes_and_prefix_overflow() {
+            let mut p=puzzle(vec![2,5],vec![14],100);
+            p.make(b'+',2,5).unwrap(); p.make(b'*',2,7).unwrap();
+            let deadline=Instant::now()+Duration::from_secs(1);
+            let run=|p:&Puzzle,maximum:usize,deadline:Instant| {
+                let mut built=HashSet::from([2,5]); let mut available=vec![2,5]; let mut steps=Vec::new();
+                let result=paid_original(p,14,&mut built,&mut available,&mut steps,maximum,deadline);
+                (result,steps)
+            };
+            let (result,steps)=run(&p,1,deadline);
+            assert_eq!(result,Err(WarmFailure::Budget)); assert_eq!(steps.len(),1);
+            let mut limited=p.clone(); limited.limit=13;
+            assert_eq!(run(&limited,5,deadline).0,Err(WarmFailure::InvalidRecipe));
+            let mut inexact=p.clone(); inexact.arguments.insert(14,(29,2));
+            inexact.definitions.get_mut(&14).unwrap().op=b'/';
+            assert_eq!(run(&inexact,5,deadline).0,Err(WarmFailure::InvalidRecipe));
+            assert_eq!(run(&p,5,Instant::now()-Duration::from_millis(1)).0,Err(WarmFailure::Deadline));
+            let mut cyclic=puzzle(vec![2],vec![5],100);
+            cyclic.make(b'+',3,2).unwrap(); cyclic.make(b'-',5,2).unwrap();
+            assert_eq!(paid_original(&cyclic,5,&mut HashSet::from([2]),&mut vec![2],
+                &mut Vec::new(),10,deadline),Err(WarmFailure::Cycle));
+        }
+
+        fn warm_frontier_fixture()->(Puzzle,Program) {
+            let p=puzzle(vec![2,5],vec![14,35,4_294_967_296],1_000_000_000_000);
+            let hint=vec![[b'+' as i32,0,0,2],[b'+' as i32,1,1,3],[b'+' as i32,3,2,4],
+                [b'*' as i32,1,1,5],[b'+' as i32,5,3,6],[b'*' as i32,2,2,7],
+                [b'*' as i32,7,7,8],[b'*' as i32,8,8,9],[b'*' as i32,9,9,10]];
+            (p,hint)
+        }
+
+        #[test]
+        fn paid_completion_finishes_the_all_target_cut_when_one_port_exceeds_depth_three() {
+            let (mut p,hint)=warm_frontier_fixture(); p.load_hint(&hint).unwrap();
+            let (removed,pool)=frontier_context(&p,&p.targets).unwrap(); assert_eq!(removed.len(),9);
+            let deadline=Instant::now()+Duration::from_secs(1); let mut metrics=Metrics::default();
+            assert!(rebuild_frontier(&p,&p.targets,&removed,&pool,deadline,
+                &mut Mt19937_64::new(0),&mut metrics,3,true).is_none());
+            let mut generator=Mt19937_64::new(0); let mut best=None;
+            for variant in 0..4 {
+                if let Some((_,program))=rebuild_frontier_warm(&p,&p.targets,&removed,&pool,
+                    deadline,&mut generator,&mut metrics,3,variant%2==1) {
+                    if best.as_ref().map_or(true,|previous:&Program|program.len()<previous.len()) { best=Some(program); }
+                }
+            }
+            let program=best.unwrap(); assert!(program.len()<=8);
+            assert!(metrics.warm_ports>0 && metrics.warm_steps>0 && metrics.warm_complete_frontiers>0);
+            let mut replay=p; replay.load_hint(&program).unwrap();
+        }
+
+        #[test]
+        fn warm_frontier_soft_deadline_preserves_valid_best_and_disables_legacy_walk() {
+            let (p,hint)=warm_frontier_fixture();
+            for flags in [48,52] {
+                let (program,metrics)=optimize(p.clone(),&hint,0,1,flags).unwrap();
+                assert!(program.len()<=hint.len()); assert_eq!(metrics.attempts,0);
+                let mut replay=p.clone(); replay.load_hint(&program).unwrap();
+            }
+        }
+
+        #[test]
+        fn recording_valid_longer_frontier_does_not_move_best_current_or_seen() {
+            let (mut original,hint)=warm_frontier_fixture(); original.load_hint(&hint).unwrap();
+            let key=graph_key(&original);
+            let mut walk=Walk {current:original.clone(),current_cost:hint.len(),best:hint,
+                best_graph:original.clone(),seen:HashSet::from([key.clone()]),archive:Some(Archive::default())};
+            let alternative=vec![[b'+' as i32,0,0,2],[b'+' as i32,0,1,3],
+                [b'*' as i32,3,0,4],[b'+' as i32,1,1,5],[b'*' as i32,1,1,6],
+                [b'+' as i32,6,5,7],[b'*' as i32,2,2,8],[b'*' as i32,8,8,9],
+                [b'*' as i32,9,9,10],[b'*' as i32,10,10,11]];
+            let mut trial=original;trial.load_hint(&alternative).unwrap();
+            let program=verified_program(&trial).unwrap();assert_eq!(program.len(),10);
+            walk.record_frontier_trial(&trial,&program);
+            assert_eq!(walk.archive.as_ref().unwrap().entries.len(),1);
+            assert!(!walk.accept(trial,program,false,false,&mut Metrics::default()));
+            assert_eq!(walk.best.len(),9);assert_eq!(walk.current_cost,9);
+            assert_eq!(graph_key(&walk.current),key);assert_eq!(graph_key(&walk.best_graph),key);
+            assert_eq!(walk.seen.len(),1);assert!(walk.seen.contains(&key));
         }
 
         #[test]

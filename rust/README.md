@@ -130,8 +130,9 @@ outputs/bin/lns-tests
 
 Arguments: `seed milliseconds flags`, defaults `0 2000 15`. The budget is
 1–600,000 milliseconds. Feature bits are 1 for helper roots, 2 for equal-cost
-moves, 4 for depth-five products, 8 for perturbations, and 16 for atomic
-multi-output frontier reconstruction. It uses the existing
+moves, 4 for depth-five products, 8 for perturbations, 16 for atomic
+multi-output frontier reconstruction, 32 for paid original completion,
+64 for related target groups, and 128 for ranked alternative plans. It uses the existing
 single-hint input and one-line `id JSON-program` output protocol. Search checks
 a soft deadline; the Python controller enforces the outer wall-time limit.
 
@@ -168,3 +169,34 @@ from nine operations to eight through shared new intermediates. The earlier
 helper-cut pilots found no gain on 20 cost-stratified cases or 40 cases ranked
 by removable private cost. Research notes distinguish this synthetic mechanism
 from demonstrated competitive savings.
+
+The optional paid completion retains an original derivation when a port has
+no sufficiently short fresh plan. It recursively materializes each missing
+ancestor once, checks exact positive bounded arithmetic, detects cycles and
+respects the deadline. Its nominal prefix cap is `min(removed + 2, 4096)`;
+the complete graph is still pruned, scheduled into 48 registers and replayed.
+Only a strictly shorter final program can replace the best. Flags48 enables
+this completion with the basic frontier search.
+
+`target_groups.rs` selects up to 16 target blocks by complete shared-ancestor
+support of size 3–8, ranked by shared removable nodes and paid private cost.
+The remaining slots mix the ordinary samples, keeping the total cap at 32.
+Related blocks are prioritized within the target-block phase. Flags80 tests
+this selection alone; flags112 combines it with paid completion. The old
+flag paths remain available for controlled comparisons.
+
+`plan_frontier.rs` enumerates alternative plans through three operations,
+with an explicit cap of twelve unique normalized plans per family/subquery.
+It ranks the actual additional operations plus the remaining ports' exact
+distance through two operations, capped at three for unknown larger distances.
+That sum is a ranking heuristic, not a valid lower bound on the shared final
+cost. New paid values are considered through an overlay without rebuilding a
+catalog for every candidate. Flags176 enables ranked plans with paid completion;
+flags240 adds related groups. Original paid completion remains available when
+no short plan is found. Default flags15 is unchanged.
+
+With trajectory capture enabled, validated neutral frontier candidates are
+archived before strict walk rejection. This retains potential inputs for global
+recipe recombination while leaving best/current/seen unchanged. The existing
+eight-graph limit and best+2 cost filter still apply. See the measured
+[shared-circuit experiments](../docs/research/2026-11-21-shared-circuit-tests.md).

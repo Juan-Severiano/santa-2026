@@ -46,6 +46,13 @@ class RustLnsRecoveryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 optimize_rust_lns(self.puzzle, self.original)
 
+    def test_unknown_feature_bit_is_rejected_before_native_execution(self):
+        with patch.dict(os.environ, {"SANTA2026_LNS_FLAGS": "256"}), \
+                patch("santa2026.rust_lns.subprocess.run") as run:
+            with self.assertRaises(ValueError):
+                optimize_rust_lns(self.puzzle, self.original)
+        run.assert_not_called()
+
 
 class RustLnsFrontierIntegrationTests(unittest.TestCase):
     @classmethod
@@ -71,7 +78,7 @@ class RustLnsFrontierIntegrationTests(unittest.TestCase):
                         (67, 69, 71, 75), 1000)
         original = [["-", 2, 0, 10], ["*", 10, 10, 11], ["*", 11, 10, 12],
                     ["+", 12, 0, 13], ["+", 12, 1, 14], ["+", 12, 2, 15], ["+", 12, 3, 16]]
-        for flags in (16, 20, 31):
+        for flags in (16, 20, 31, 48, 80, 112, 176, 240):
             with self.subTest(flags=flags), patch.dict(os.environ, {
                     "SANTA2026_LNS_BINARY": str(self.binary),
                     "SANTA2026_LNS_FLAGS": str(flags), "SANTA2026_LNS_MS": "250"}):
